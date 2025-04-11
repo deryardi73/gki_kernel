@@ -38,6 +38,12 @@
 *  Tuning Parameter
 ***************************************/
 
+/*===    Dependency    ===*/
+#define LZ4_HC_STATIC_LINKING_ONLY
+#include "lz4hc.h"
+#include <linux/slab.h>
+
+
 /*! HEAPMODE :
  *  Select how stateless HC compression functions like `LZ4_compress_HC()`
  *  allocate memory for their workspace:
@@ -47,12 +53,6 @@
 #ifndef LZ4HC_HEAPMODE
 #  define LZ4HC_HEAPMODE 1
 #endif
-
-
-/*===    Dependency    ===*/
-#define LZ4_HC_STATIC_LINKING_ONLY
-#include "lz4hc.h"
-#include <limits.h>
 
 
 /*===   Shared lz4.c code   ===*/
@@ -78,6 +78,8 @@ typedef enum { noDictCtx, usingDictCtxHc } dictCtx_directive;
 
 
 /*===   Macros   ===*/
+#undef MIN
+#undef MAX
 #define MIN(a,b)   ( (a) < (b) ? (a) : (b) )
 #define MAX(a,b)   ( (a) > (b) ? (a) : (b) )
 
@@ -1516,23 +1518,12 @@ int LZ4_compress_HC_extStateHC (void* state, const char* src, char* dst, int src
     return LZ4_compress_HC_extStateHC_fastReset(state, src, dst, srcSize, dstCapacity, compressionLevel);
 }
 
-int LZ4_compress_HC(const char* src, char* dst, int srcSize, int dstCapacity, int compressionLevel)
+int LZ4_compress_HC(const char* src, char* dst, int srcSize, int dstCapacity, int compressionLevel, void *wrkmem)
 {
-    int cSize;
-#if defined(LZ4HC_HEAPMODE) && LZ4HC_HEAPMODE==1
-    LZ4_streamHC_t* const statePtr = (LZ4_streamHC_t*)ALLOC(sizeof(LZ4_streamHC_t));
-    if (statePtr==NULL) return 0;
-#else
-    LZ4_streamHC_t state;
-    LZ4_streamHC_t* const statePtr = &state;
-#endif
     DEBUGLOG(5, "LZ4_compress_HC")
-    cSize = LZ4_compress_HC_extStateHC(statePtr, src, dst, srcSize, dstCapacity, compressionLevel);
-#if defined(LZ4HC_HEAPMODE) && LZ4HC_HEAPMODE==1
-    FREEMEM(statePtr);
-#endif
-    return cSize;
+    return LZ4_compress_HC_extStateHC(wrkmem, src, dst, srcSize, dstCapacity, compressionLevel);
 }
+EXPORT_SYMBOL(LZ4_compress_HC);
 
 /* state is presumed sized correctly (>= sizeof(LZ4_streamHC_t)) */
 int LZ4_compress_HC_destSize(void* state, const char* source, char* dest, int* sourceSizePtr, int targetDestSize, int cLevel)
@@ -1834,11 +1825,7 @@ static int LZ4HC_compress_optimal ( LZ4HC_CCtx_internal* ctx,
 {
     int retval = 0;
 #define TRAILING_LITERALS 3
-#if defined(LZ4HC_HEAPMODE) && LZ4HC_HEAPMODE==1
-    LZ4HC_optimal_t* const opt = (LZ4HC_optimal_t*)ALLOC(sizeof(LZ4HC_optimal_t) * (LZ4_OPT_NUM + TRAILING_LITERALS));
-#else
-    LZ4HC_optimal_t opt[LZ4_OPT_NUM + TRAILING_LITERALS];   /* ~64 KB, which is a bit large for stack... */
-#endif
+    LZ4HC_optimal_t* const opt = kvmalloc(sizeof(LZ4HC_optimal_t) * (LZ4_OPT_NUM + TRAILING_LITERALS), GFP_NOFS);
 
     const BYTE* ip = (const BYTE*) source;
     const BYTE* anchor = ip;
@@ -1852,9 +1839,7 @@ static int LZ4HC_compress_optimal ( LZ4HC_CCtx_internal* ctx,
     int ovoff = 0;
 
     /* init */
-#if defined(LZ4HC_HEAPMODE) && LZ4HC_HEAPMODE==1
     if (opt == NULL) goto _return_label;
-#endif
     DEBUGLOG(5, "LZ4HC_compress_optimal(dst=%p, dstCapa=%u)", dst, (unsigned)dstCapacity);
     *srcSizePtr = 0;
     if (limit == fillOutput) oend -= LASTLITERALS;   /* Hack for support LZ4 format restriction */
@@ -2116,34 +2101,10 @@ if (limit == fillOutput) {
      goto _last_literals;
 }
 _return_label:
-#if defined(LZ4HC_HEAPMODE) && LZ4HC_HEAPMODE==1
-     if (opt) FREEMEM(opt);
-#endif
+     kvfree(opt);
      return retval;
 }
 
-
-/***************************************************
-*  Deprecated Functions
-***************************************************/
-
-/* These functions currently generate deprecation warnings */
-
-/* Wrappers for deprecated compression functions */
-int LZ4_compressHC(const char* src, char* dst, int srcSize) { return LZ4_compress_HC (src, dst, srcSize, LZ4_compressBound(srcSize), 0); }
-int LZ4_compressHC_limitedOutput(const char* src, char* dst, int srcSize, int maxDstSize) { return LZ4_compress_HC(src, dst, srcSize, maxDstSize, 0); }
-int LZ4_compressHC2(const char* src, char* dst, int srcSize, int cLevel) { return LZ4_compress_HC (src, dst, srcSize, LZ4_compressBound(srcSize), cLevel); }
-int LZ4_compressHC2_limitedOutput(const char* src, char* dst, int srcSize, int maxDstSize, int cLevel) { return LZ4_compress_HC(src, dst, srcSize, maxDstSize, cLevel); }
-int LZ4_compressHC_withStateHC (void* state, const char* src, char* dst, int srcSize) { return LZ4_compress_HC_extStateHC (state, src, dst, srcSize, LZ4_compressBound(srcSize), 0); }
-int LZ4_compressHC_limitedOutput_withStateHC (void* state, const char* src, char* dst, int srcSize, int maxDstSize) { return LZ4_compress_HC_extStateHC (state, src, dst, srcSize, maxDstSize, 0); }
-int LZ4_compressHC2_withStateHC (void* state, const char* src, char* dst, int srcSize, int cLevel) { return LZ4_compress_HC_extStateHC(state, src, dst, srcSize, LZ4_compressBound(srcSize), cLevel); }
-int LZ4_compressHC2_limitedOutput_withStateHC (void* state, const char* src, char* dst, int srcSize, int maxDstSize, int cLevel) { return LZ4_compress_HC_extStateHC(state, src, dst, srcSize, maxDstSize, cLevel); }
-int LZ4_compressHC_continue (LZ4_streamHC_t* ctx, const char* src, char* dst, int srcSize) { return LZ4_compress_HC_continue (ctx, src, dst, srcSize, LZ4_compressBound(srcSize)); }
-int LZ4_compressHC_limitedOutput_continue (LZ4_streamHC_t* ctx, const char* src, char* dst, int srcSize, int maxDstSize) { return LZ4_compress_HC_continue (ctx, src, dst, srcSize, maxDstSize); }
-
-
-/* Deprecated streaming functions */
-int LZ4_sizeofStreamStateHC(void) { return sizeof(LZ4_streamHC_t); }
 
 /* state is presumed correctly sized, aka >= sizeof(LZ4_streamHC_t)
  * @return : 0 on success, !=0 if error */
