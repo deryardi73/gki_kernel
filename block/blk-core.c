@@ -364,7 +364,7 @@ int __bio_queue_enter(struct request_queue *q, struct bio *bio)
 		 * reordered.
 		 */
 		smp_rmb();
-		wait_event(q->mq_freeze_wq,
+		wait_event_interruptible(q->mq_freeze_wq,
 			   (!q->mq_freeze_depth &&
 			    blk_pm_resume_queue(false, q)) ||
 			   test_bit(GD_DEAD, &disk->state));
