@@ -691,7 +691,7 @@ static int __init map_entry_trampoline(void)
 	pgprot_val(prot) &= ~PTE_NG;
 
 	/* Map only the text into the trampoline page table */
-	memset(tramp_pg_dir, 0, PGD_SIZE);
+	clear_page(tramp_pg_dir);
 	__create_pgd_mapping(tramp_pg_dir, pa_start, TRAMP_VALIAS,
 			     entry_tramp_text_size(), prot,
 			     __pgd_pgtable_alloc, NO_BLOCK_MAPPINGS);
