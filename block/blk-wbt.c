@@ -635,7 +635,13 @@ static enum wbt_flags bio_to_wbt_flags(struct rq_wb *rwb, struct bio *bio)
 static void wbt_cleanup(struct rq_qos *rqos, struct bio *bio)
 {
 	struct rq_wb *rwb = RQWB(rqos);
-	enum wbt_flags flags = bio_to_wbt_flags(rwb, bio);
+	enum wbt_flags flags;
+
+	if (!(bio->bi_opf & REQ_WBT))
+		return;
+
+	flags = bio_to_wbt_flags(rwb, bio);
+	bio->bi_opf &= ~REQ_WBT;
 	__wbt_done(rqos, flags);
 }
 
@@ -656,6 +662,7 @@ static void wbt_wait(struct rq_qos *rqos, struct bio *bio)
 		return;
 	}
 
+	bio->bi_opf |= REQ_WBT;
 	__wbt_wait(rwb, flags, bio->bi_opf);
 
 	if (!blk_stat_is_active(rwb->cb))
@@ -665,7 +672,8 @@ static void wbt_wait(struct rq_qos *rqos, struct bio *bio)
 static void wbt_track(struct rq_qos *rqos, struct request *rq, struct bio *bio)
 {
 	struct rq_wb *rwb = RQWB(rqos);
-	rq->wbt_flags |= bio_to_wbt_flags(rwb, bio);
+	if (bio->bi_opf & REQ_WBT)
+	    rq->wbt_flags |= bio_to_wbt_flags(rwb, bio);
 }
 
 static void wbt_issue(struct rq_qos *rqos, struct request *rq)

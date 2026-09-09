@@ -439,6 +439,7 @@ enum req_flag_bits {
 	/* for REQ_OP_WRITE_ZEROES: */
 	__REQ_NOUNMAP,		/* do not free blocks when zeroing */
 
+	__REQ_WBT,              /* for wbt use */
 	__REQ_NR_BITS,		/* stops here */
 };
 
@@ -467,6 +468,7 @@ enum req_flag_bits {
 
 #define REQ_NOUNMAP	(__force blk_opf_t)(1ULL << __REQ_NOUNMAP)
 
+#define REQ_WBT         (__force blk_opf_t)(1ULL << __REQ_WBT)
 #define REQ_FAILFAST_MASK \
 	(REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT | REQ_FAILFAST_DRIVER)
 
