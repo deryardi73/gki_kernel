@@ -2665,6 +2665,31 @@ unsigned long arch_scale_freq_capacity(int cpu)
 }
 #endif
 
+#ifndef arch_scale_min_freq_capacity
+/**
+ * arch_scale_min_freq_capacity - get the minimum frequency scale factor of a
+ * given CPU.
+ * @cpu: the CPU in question.
+ *
+ * Return: the minimum frequency scale factor normalized against
+ * SCHED_CAPACITY_SCALE, i.e.
+ *
+ *     f_min
+ *     ------ * SCHED_CAPACITY_SCALE
+ *     f_max
+ *
+ * This default implementation assumes no minimum frequency floor is
+ * enforced, so it returns 0. Platforms that expose a hardware/firmware
+ * minimum-frequency-based capacity (e.g. via a vendor arch_topology hook)
+ * should override this.
+ */
+static __always_inline
+unsigned long arch_scale_min_freq_capacity(int cpu)
+{
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_SCHED_DEBUG
 /*
  * In double_lock_balance()/double_rq_lock(), we use raw_spin_rq_lock() to
