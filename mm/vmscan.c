@@ -203,7 +203,7 @@ struct scan_control {
 /*
  * From 0 .. MAX_SWAPPINESS.  Higher means more swappy.
  */
-int vm_swappiness = 60;
+int vm_swappiness = 30;
 
 LIST_HEAD(shrinker_list);
 DECLARE_RWSEM(shrinker_rwsem);

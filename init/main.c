@@ -10,7 +10,7 @@
  *  Simplified starting of init:  Michael A. Griffith <grif@acm.org>
  */
 
-#define DEBUG		/* Enable initcall_debug */
+//#define DEBUG		/* Enable initcall_debug */
 
 #include <linux/types.h>
 #include <linux/extable.h>
@@ -803,8 +803,7 @@ void __init __weak pgtable_cache_init(void) { }
 
 void __init __weak trap_init(void) { }
 
-bool initcall_debug;
-core_param(initcall_debug, initcall_debug, bool, 0644);
+bool initcall_debug = false;
 
 #ifdef TRACEPOINTS_ENABLED
 static void __init initcall_debug_enable(void);
