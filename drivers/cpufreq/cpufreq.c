@@ -670,6 +670,10 @@ static struct cpufreq_governor *find_governor(const char *str_governor)
 {
 	struct cpufreq_governor *t;
 
+	/* Forbid init from changing cpufreq governor by default */
+	if (!strncmp(current->comm, "init", sizeof("init")))
+		return NULL;
+
 	for_each_governor(t)
 		if (!strncasecmp(str_governor, t->name, CPUFREQ_NAME_LEN))
 			return t;
