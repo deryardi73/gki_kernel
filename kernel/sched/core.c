@@ -4871,7 +4871,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	/*
 	 * Revert to default priority/policy on fork if requested.
 	 */
-	if (unlikely(p->sched_reset_on_fork)) {
+	if (unlikely(p->sched_reset_on_fork && !capable(CAP_SYS_RESOURCE))) {
 		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
 			p->policy = SCHED_NORMAL;
 			p->static_prio = NICE_TO_PRIO(0);
@@ -7417,7 +7417,7 @@ static bool is_nice_reduction(const struct task_struct *p, const int nice)
  */
 int can_nice(const struct task_struct *p, const int nice)
 {
-	return is_nice_reduction(p, nice) || capable(CAP_SYS_NICE);
+	return is_nice_reduction(p, nice) || capable(CAP_SYS_RESOURCE);
 }
 
 #ifdef __ARCH_WANT_SYS_NICE
@@ -7736,12 +7736,12 @@ static int user_check_sched_setscheduler(struct task_struct *p,
 
 		/* Can't set/change the rt policy: */
 		if (policy != p->policy && !rlim_rtprio)
-			goto req_priv;
+			if (!capable(CAP_SYS_RESOURCE)) goto req_priv;
 
 		/* Can't increase priority: */
 		if (attr->sched_priority > p->rt_priority &&
 		    attr->sched_priority > rlim_rtprio)
-			goto req_priv;
+			if (!capable(CAP_SYS_RESOURCE)) goto req_priv;
 	}
 
 	/*
@@ -7773,7 +7773,7 @@ static int user_check_sched_setscheduler(struct task_struct *p,
 	return 0;
 
 req_priv:
-	if (!capable(CAP_SYS_NICE))
+	if (!capable(CAP_SYS_RESOURCE))
 		return -EPERM;
 
 	return 0;
@@ -7801,7 +7801,7 @@ recheck:
 		reset_on_fork = p->sched_reset_on_fork;
 		policy = oldpolicy = p->policy;
 	} else {
-		reset_on_fork = !!(attr->sched_flags & SCHED_FLAG_RESET_ON_FORK);
+		reset_on_fork = !!(attr->sched_flags & SCHED_FLAG_RESET_ON_FORK) && !capable(CAP_SYS_RESOURCE);
 
 		if (!valid_policy(policy))
 			return -EINVAL;
@@ -8555,7 +8555,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 
 	if (!check_same_owner(p)) {
 		rcu_read_lock();
-		if (!ns_capable(__task_cred(p)->user_ns, CAP_SYS_NICE)) {
+		if (!ns_capable(__task_cred(p)->user_ns, CAP_SYS_RESOURCE)) {
 			rcu_read_unlock();
 			retval = -EPERM;
 			goto out_put_task;

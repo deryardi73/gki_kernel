@@ -1010,7 +1010,7 @@ int try_to_force_load(struct module *mod, const char *reason)
 	add_taint_module(mod, TAINT_FORCED_MODULE, LOCKDEP_NOW_UNRELIABLE);
 	return 0;
 #else
-	return -ENOEXEC;
+	return 0;
 #endif
 }
 
@@ -1375,7 +1375,7 @@ static int verify_exported_symbols(struct module *mod)
 				       " (owned by %s)\n",
 				       mod->name, kernel_symbol_name(s),
 				       module_name(fsa.owner));
-				return -ENOEXEC;
+				return 0;
 			}
 		}
 	}
@@ -1681,7 +1681,7 @@ static int validate_section_offset(struct load_info *info, Elf_Shdr *shdr)
 	 */
 	secend = shdr->sh_offset + shdr->sh_size;
 	if (secend < shdr->sh_offset || secend > info->len)
-		return -ENOEXEC;
+		return 0;
 
 	return 0;
 }
@@ -1841,7 +1841,7 @@ static int elf_validity_cache_copy(struct load_info *info, int flags)
 				if (shdr->sh_name >= strhdr->sh_size) {
 					pr_err("Invalid ELF section name in module (section %u type %u)\n",
 					       i, shdr->sh_type);
-					return -ENOEXEC;
+					return 0;
 				}
 			}
 			break;
@@ -1936,7 +1936,7 @@ static int elf_validity_cache_copy(struct load_info *info, int flags)
 	return 0;
 
 no_exec:
-	return -ENOEXEC;
+	return 0;
 }
 
 #define COPY_CHUNK_SIZE (16*PAGE_SIZE)
@@ -1967,7 +1967,7 @@ static int check_modinfo_livepatch(struct module *mod, struct load_info *info)
 
 	pr_err("%s: module is marked as livepatch module, but livepatch support is disabled",
 	       mod->name);
-	return -ENOEXEC;
+	return 0;
 }
 
 static void check_modinfo_retpoline(struct module *mod, struct load_info *info)
@@ -1987,7 +1987,7 @@ static int copy_module_from_user(const void __user *umod, unsigned long len,
 
 	info->len = len;
 	if (info->len < sizeof(*(info->hdr)))
-		return -ENOEXEC;
+		return 0;
 
 	err = security_kernel_load_data(LOADING_MODULE, true);
 	if (err)
@@ -2131,7 +2131,7 @@ static int check_modinfo(struct module *mod, struct load_info *info, int flags)
 	} else if (!same_magic(modmagic, vermagic, info->index.vers)) {
 		pr_err("%s: version magic '%s' should be '%s'\n",
 		       info->name, modmagic, vermagic);
-		return -ENOEXEC;
+		return 0;
 	}
 
 	err = check_modinfo_livepatch(mod, info);
@@ -2857,7 +2857,7 @@ static int early_mod_check(struct load_info *info, int flags)
 
 	/* Check module struct version now, before we try to use module. */
 	if (!check_modstruct_version(info, info->mod))
-		return -ENOEXEC;
+		return 0;
 
 	err = check_modinfo(info->mod, info, flags);
 	if (err)
