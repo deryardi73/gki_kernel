@@ -41,7 +41,7 @@ static DEFINE_IDR(zram_index_idr);
 static DEFINE_MUTEX(zram_index_mutex);
 
 static int zram_major;
-static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;
+static const char *default_compressor = "lz4";
 
 /* Module params (documentation at end) */
 static unsigned int num_devices = 1;
@@ -985,19 +985,10 @@ static ssize_t __comp_algorithm_show(struct zram *zram, u32 prio, char *buf)
 static int __comp_algorithm_store(struct zram *zram, u32 prio, const char *buf)
 {
 	char *compressor;
-	size_t sz;
 
-	sz = strlen(buf);
-	if (sz >= CRYPTO_MAX_ALG_NAME)
-		return -E2BIG;
-
-	compressor = kstrdup(buf, GFP_KERNEL);
+	compressor = kstrdup("lz4", GFP_KERNEL);
 	if (!compressor)
 		return -ENOMEM;
-
-	/* ignore trailing newline */
-	if (sz > 0 && compressor[sz - 1] == '\n')
-		compressor[sz - 1] = 0x00;
 
 	if (!zcomp_available_algorithm(compressor)) {
 		kfree(compressor);
