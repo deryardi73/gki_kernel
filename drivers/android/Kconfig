@@ -159,16 +159,31 @@ config ANDROID_VENDOR_OEM_DATA
 
 config ANDROID_SIMPLE_LMK
 	bool "Simple Android Low Memory Killer"
-	depends on !ANDROID_LOW_MEMORY_KILLER && !MEMCG && !PSI
+	depends on !ANDROID_LOW_MEMORY_KILLER && !PSI
 	help
 	  This is a complete low memory killer solution for Android that is
 	  small and simple. Processes are killed according to the priorities
 	  that Android gives them, so that the least important processes are
 	  always killed first. Processes are killed until memory deficits are
 	  satisfied, as observed from direct reclaim and kswapd reclaim
-	  struggling to free up pages, via VM pressure notifications.
+	  struggling to free up pages.
 
 if ANDROID_SIMPLE_LMK
+
+config ANDROID_SIMPLE_LMK_AGGRESSION
+	int "Reclaim frequency selection"
+	range 1 3
+	default 1
+	help
+	  This value determines how frequently Simple LMK will perform memory
+	  reclaims, as a factor of kswapd's scan priority. A lower value
+	  corresponds to less frequent reclaims, which maximizes memory usage.
+	  The range of values has a logarithmic correlation; 2 is twice as
+	  aggressive as 1, and 3 is twice as aggressive as 2.
+
+	  Choosing a value of 1 here works well with systems that have 4 GiB
+	  of memory. If the default doesn't work well, then this value should
+	  be tweaked based on empirical results using different values.
 
 config ANDROID_SIMPLE_LMK_MINFREE
 	int "Minimum MiB of memory to free per reclaim"

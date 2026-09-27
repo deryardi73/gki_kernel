@@ -12,7 +12,6 @@
 #include <linux/oom.h>
 #include <linux/sched/mm.h>
 #include <linux/sort.h>
-#include <linux/vmpressure.h>
 #include <uapi/linux/sched/types.h>
 
 /* The minimum number of pages to free per reclaim */
@@ -447,23 +446,28 @@ void simple_lmk_mm_freed(struct mm_struct *mm)
 	read_unlock(&mm_free_lock);
 }
 
-static int simple_lmk_vmpressure_cb(struct notifier_block *nb,
-				    unsigned long pressure, void *data)
+/*
+ * NOTE: upstream vmpressure_notifier_register()/_unregister() no longer
+ * exist in this kernel tree, so the vmpressure-notifier trigger used by
+ * upstream simple_lmk cannot be ported as-is. Instead, reclaim is driven
+ * directly from kswapd's scan priority in mm/vmscan.c (the mechanism
+ * simple_lmk originally used before switching to vmpressure), via
+ * simple_lmk_decide_reclaim() and simple_lmk_stop_reclaim() below.
+ */
+void simple_lmk_decide_reclaim(int kswapd_priority)
 {
-	if (pressure == 100) {
+	if (kswapd_priority == CONFIG_ANDROID_SIMPLE_LMK_AGGRESSION) {
 		atomic_set(&needs_reclaim, 1);
 		smp_mb__after_atomic();
 		if (waitqueue_active(&oom_waitq))
 			wake_up(&oom_waitq);
 	}
-
-	return NOTIFY_OK;
 }
 
-static struct notifier_block vmpressure_notif = {
-	.notifier_call = simple_lmk_vmpressure_cb,
-	.priority = INT_MAX
-};
+void simple_lmk_stop_reclaim(void)
+{
+	atomic_set(&needs_reclaim, 0);
+}
 
 /* Initialize Simple LMK when lmkd in Android writes to the minfree parameter */
 static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
@@ -478,7 +482,6 @@ static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
 		thread = kthread_run(simple_lmk_reclaim_thread, NULL,
 				     "simple_lmkd");
 		BUG_ON(IS_ERR(thread));
-		BUG_ON(vmpressure_notifier_register(&vmpressure_notif));
 	}
 
 	return 0;
