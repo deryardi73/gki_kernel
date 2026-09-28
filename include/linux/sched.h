@@ -525,6 +525,15 @@ struct sched_statistics {
 #endif /* CONFIG_SCHEDSTATS */
 } ____cacheline_aligned;
 
+#ifdef CONFIG_SCHED_BORE
+struct sched_burst_cache {
+	u8				score;
+	u32				count;
+	u64				timestamp;
+    spinlock_t		lock;
+};
+#endif // CONFIG_SCHED_BORE
+
 struct sched_entity {
 	/* For load-balancing: */
 	struct load_weight		load;
@@ -534,11 +543,11 @@ struct sched_entity {
 
 	struct list_head		group_node;
 	unsigned int			on_rq;
-
 	u64				exec_start;
 	u64				sum_exec_runtime;
 	u64				prev_sum_exec_runtime;
 	u64				vruntime;
+/* BORE variables moved to struct bore_sched_data via KABI */
 	s64				vlag;
 	u64				slice;
 
@@ -568,7 +577,7 @@ struct sched_entity {
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
+	ANDROID_KABI_USE(4, struct bore_sched_data *bore);
 };
 
 struct sched_rt_entity {

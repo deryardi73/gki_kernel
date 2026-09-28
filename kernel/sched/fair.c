@@ -61,6 +61,8 @@
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
 
+#include <linux/sched/bore.h>
+
 /*
  * Targeted preemption latency for CPU-bound tasks:
  *
@@ -87,17 +89,31 @@ EXPORT_SYMBOL_GPL(sysctl_sched_latency);
  *   SCHED_TUNABLESCALING_LINEAR - scaled linear, *ncpus
  *
  * (default SCHED_TUNABLESCALING_LOG = *(1+ilog(ncpus))
+ * BORE : default SCHED_TUNABLESCALING_NONE = *1 constant
+ * EEVDF: default SCHED_TUNABLESCALING_LOG  = *(1+ilog(ncpus))
  */
+#ifdef CONFIG_SCHED_BORE
+unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_NONE;
+#else // !CONFIG_SCHED_BORE
 unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
+#endif // CONFIG_SCHED_BORE
 
 /*
  * Minimal preemption granularity for CPU-bound tasks:
  *
- * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
+ * BORE : base_slice = minimum multiple of nsecs_per_tick >= min_base_slice
+ * (default min_base_slice = 2000000 constant, units: nanoseconds)
+ * EEVDF: default 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds
  */
+#ifdef CONFIG_SCHED_BORE
+static const unsigned int nsecs_per_tick       = 1000000000ULL / HZ;
+unsigned int sysctl_sched_min_base_slice       = CONFIG_MIN_BASE_SLICE_NS;
+__read_mostly uint sysctl_sched_base_slice     = nsecs_per_tick;
+#else // !CONFIG_SCHED_BORE
 unsigned int sysctl_sched_base_slice			= 750000ULL;
-EXPORT_SYMBOL_GPL(sysctl_sched_base_slice);
 static unsigned int normalized_sysctl_sched_base_slice	= 750000ULL;
+#endif // CONFIG_SCHED_BORE
+EXPORT_SYMBOL_GPL(sysctl_sched_base_slice);
 
 /*
  * After fork, child runs first. If set to 0 (default) then
@@ -231,6 +247,14 @@ static inline void update_load_set(struct load_weight *lw, unsigned long w)
  *
  * This idea comes from the SD scheduler of Con Kolivas:
  */
+#ifdef CONFIG_SCHED_BORE
+static void update_sysctl(void) {
+	sysctl_sched_base_slice = nsecs_per_tick *
+		max(1UL, DIV_ROUND_UP(sysctl_sched_min_base_slice, nsecs_per_tick));
+}
+void sched_update_min_base_slice(void) { update_sysctl(); }
+EXPORT_SYMBOL_GPL(sched_update_min_base_slice);
+#else // !CONFIG_SCHED_BORE
 static unsigned int get_update_sysctl_factor(void)
 {
 	unsigned int cpus = min_t(unsigned int, num_online_cpus(), 8);
@@ -261,6 +285,7 @@ static void update_sysctl(void)
 	SET_SYSCTL(sched_base_slice);
 #undef SET_SYSCTL
 }
+#endif // CONFIG_SCHED_BORE
 
 void __init sched_init_granularity(void)
 {
@@ -738,6 +763,9 @@ static s64 entity_lag(u64 avruntime, struct sched_entity *se)
 
 	vlag = avruntime - se->vruntime;
 	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
+#ifdef CONFIG_SCHED_BORE
+	limit >>= !!sched_bore;
+#endif // CONFIG_SCHED_BORE
 
 	return clamp(vlag, -limit, limit);
 }
@@ -941,6 +969,10 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 	 * until it gets a new slice. See the HACK in set_next_entity().
 	 */
 	if (sched_feat(RUN_TO_PARITY) && curr && curr->vlag == curr->deadline)
+#ifdef CONFIG_SCHED_BORE
+		if (!(likely(sched_bore) && likely(sched_burst_parity_threshold) &&
+			sched_burst_parity_threshold < cfs_rq->nr_running))
+#endif // CONFIG_SCHED_BORE
 		return curr;
 
 	/* Pick the leftmost entity if it's eligible */
@@ -999,6 +1031,13 @@ struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
  * Scheduling class statistics methods:
  */
 #ifdef CONFIG_SMP
+#ifdef CONFIG_SCHED_BORE
+int sched_update_scaling(void)
+{
+	return 0;
+}
+EXPORT_SYMBOL_GPL(sched_update_scaling);
+#else /* !CONFIG_SCHED_BORE */
 int sched_update_scaling(void)
 {
 	unsigned int factor = get_update_sysctl_factor();
@@ -1010,6 +1049,8 @@ int sched_update_scaling(void)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(sched_update_scaling);
+#endif /* CONFIG_SCHED_BORE */
 #endif
 #endif
 
@@ -1185,6 +1226,12 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	curr->sum_exec_runtime += delta_exec;
 	schedstat_add(cfs_rq->exec_clock, delta_exec);
 
+#ifdef CONFIG_SCHED_BORE
+	if (likely(sched_bore) && curr->bore) {
+		curr->bore->burst_time += delta_exec;
+		update_burst_penalty(curr);
+	}
+#endif // CONFIG_SCHED_BORE
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
 	update_deadline(cfs_rq, curr);
 	update_min_vruntime(cfs_rq);
@@ -3745,7 +3792,7 @@ static void reweight_eevdf(struct sched_entity *se, u64 avruntime,
 	se->deadline = avruntime + vslice;
 }
 
-static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
 	bool curr = cfs_rq->curr == se;
@@ -3798,6 +3845,7 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 		update_min_vruntime(cfs_rq);
 	}
 }
+EXPORT_SYMBOL_GPL(reweight_entity);
 
 void reweight_task(struct task_struct *p, int prio)
 {
@@ -5117,6 +5165,9 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 *
 	 * EEVDF: placement strategy #1 / #2
 	 */
+#ifdef CONFIG_SCHED_BORE
+	if (se->vlag)
+#endif // CONFIG_SCHED_BORE
 	if (sched_feat(PLACE_LAG) && cfs_rq->nr_running) {
 		struct sched_entity *curr = cfs_rq->curr;
 		unsigned long load;
@@ -5187,6 +5238,16 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	se->vruntime = vruntime - lag;
 
+	if (sched_feat(PLACE_REL_DEADLINE) && se->bore && se->bore->rel_deadline) {
+		se->deadline += se->vruntime;
+		if (se->bore) se->bore->rel_deadline = 0;
+		return;
+	}
+#ifdef CONFIG_SCHED_BORE
+	else if (likely(sched_bore))
+		vslice >>= !!(flags & sched_deadline_boost_mask);
+	else
+#endif // CONFIG_SCHED_BORE
 	/*
 	 * When joining the competition; the exisiting tasks will be,
 	 * on average, halfway through their slice, as such start tasks
@@ -5297,6 +5358,7 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 static void
 dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
+	bool sleep = flags & DEQUEUE_SLEEP;
 	int action = UPDATE_TG;
 
 	if (entity_is_task(se) && task_on_rq_migrating(task_of(se)))
@@ -5324,6 +5386,11 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	clear_buddies(cfs_rq, se);
 
 	update_entity_lag(cfs_rq, se);
+	if (sched_feat(PLACE_REL_DEADLINE) && !sleep) {
+		se->deadline -= se->vruntime;
+		if (se->bore) se->bore->rel_deadline = 1;
+	}
+
 	if (se != cfs_rq->curr)
 		__dequeue_entity(cfs_rq, se);
 	se->on_rq = 0;
@@ -6750,6 +6817,16 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	bool was_sched_idle = sched_idle_rq(rq);
 
 	util_est_dequeue(&rq->cfs, p);
+	trace_android_rvh_dequeue_task(rq, p, flags);
+
+#ifdef CONFIG_SCHED_BORE
+	if (task_sleep) {
+		cfs_rq = cfs_rq_of(se);
+		if (cfs_rq->curr == se)
+			update_curr(cfs_rq);
+		restart_burst(se);
+	}
+#endif // CONFIG_SCHED_BORE
 
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
@@ -8534,16 +8611,26 @@ static void yield_task_fair(struct rq *rq)
 	/*
 	 * Are we the only task in the tree?
 	 */
+#ifdef CONFIG_SCHED_BORE
+	update_rq_clock(rq);
+	update_curr(cfs_rq);
+	restart_burst_rescale_deadline(se);
+#endif // CONFIG_SCHED_BORE
+
 	if (unlikely(rq->nr_running == 1))
 		return;
 
+	trace_android_rvh_do_sched_yield(rq);
+
 	clear_buddies(cfs_rq, se);
 
+#ifndef CONFIG_SCHED_BORE
 	update_rq_clock(rq);
 	/*
 	 * Update run-time statistics of the 'current'.
 	 */
 	update_curr(cfs_rq);
+#endif // CONFIG_SCHED_BORE
 	/*
 	 * Tell update_rq_clock() that we've just updated,
 	 * so we don't do microscopic update in schedule()
@@ -12684,6 +12771,9 @@ static void task_fork_fair(struct task_struct *p)
 	curr = cfs_rq->curr;
 	if (curr)
 		update_curr(cfs_rq);
+#ifdef CONFIG_SCHED_BORE
+	update_burst_score(se);
+#endif // CONFIG_SCHED_BORE
 	place_entity(cfs_rq, se, ENQUEUE_INITIAL);
 	rq_unlock(rq, &rf);
 }
@@ -12796,6 +12886,10 @@ static void attach_task_cfs_rq(struct task_struct *p)
 
 static void switched_from_fair(struct rq *rq, struct task_struct *p)
 {
+	if (p->se.bore) p->se.bore->rel_deadline = 0;
+#ifdef CONFIG_SCHED_BORE
+	reset_task_bore(p);
+#endif // CONFIG_SCHED_BORE
 	detach_task_cfs_rq(p);
 }
 
