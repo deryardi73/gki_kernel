@@ -48,18 +48,26 @@ struct nap_weights {
 } __aligned(32);
 
 /* ISA-specific forward pass implementations */
+struct nap_cpu_data;
+#ifdef CONFIG_X86_64
 void nap_nn_forward_sse2(const float *input, float *output,
 			 float *hidden_save, const struct nap_weights *w);
 void nap_nn_forward_avx2(const float *input, float *output,
 			 float *hidden_save, const struct nap_weights *w);
 
 /* ISA-specific online learning (backpropagation) */
-struct nap_cpu_data;
 void nap_nn_learn_sse2(struct nap_cpu_data *d);
 void nap_nn_learn_avx2(struct nap_cpu_data *d);
 
 /* Static key for ISA dispatch (defined in nap.c) */
 DECLARE_STATIC_KEY_FALSE(nap_use_avx2);
+#endif
+
+#ifdef CONFIG_ARM64
+void nap_nn_forward_neon(const float *input, float *output,
+			 float *hidden_save, const struct nap_weights *w);
+void nap_nn_learn_neon(struct nap_cpu_data *d);
+#endif
 
 /* ================================================================
  * SIMD type definitions and helpers (GCC vector extensions)
@@ -166,6 +174,12 @@ static inline v4sf fast_log2f_sse(v4sf x)
 
 	return e + p;
 }
+
+#define fast_log2f_v4  fast_log2f_sse
+
+#elif defined(__ARM_NEON)
+
+#include "nap_neon.h"
 
 #endif /* __SSE2__ */
 

@@ -28,9 +28,15 @@
 #include <linux/sysfs.h>
 #include <linux/string.h>
 #include <linux/tick.h>
+#ifdef CONFIG_ARM64
+#include <asm/cpufeature.h>
+#include <asm/fpsimd.h>
+#include <asm/simd.h>
+#else
 #include <asm/simd.h>
 #include <asm/fpu/api.h>
 #include <asm/processor.h>
+#endif
 
 #include "nap.h"
 
@@ -55,6 +61,29 @@
  * ISA dispatch via static keys (definitions only; dispatch in nap_fpu.c)
  * ================================================================ */
 
+#ifdef CONFIG_ARM64
+
+static void __init nap_detect_simd(void)
+{
+	pr_info("nap: using NEON\n");
+}
+
+static inline bool nap_fpu_begin(void)
+{
+	if (!system_supports_fpsimd() || in_hardirq() || in_nmi() ||
+	    this_cpu_read(fpsimd_context_busy))
+		return false;
+
+	fpsimd_save_and_flush_cpu_state();
+	return true;
+}
+
+static inline void nap_fpu_end(void)
+{
+}
+
+#else
+
 DEFINE_STATIC_KEY_FALSE(nap_use_avx2);
 
 static void __init nap_detect_simd(void)
@@ -67,6 +96,21 @@ static void __init nap_detect_simd(void)
 		pr_info("nap: using SSE2\n");
 	}
 }
+
+static inline bool nap_fpu_begin(void)
+{
+	if (!may_use_simd())
+		return false;
+	kernel_fpu_begin();
+	return true;
+}
+
+static inline void nap_fpu_end(void)
+{
+	kernel_fpu_end();
+}
+
+#endif
 
 /* ================================================================
  * Per-CPU data
@@ -224,10 +268,9 @@ static int nap_select(struct cpuidle_driver *drv,
 
 	d->short_circuited = false;
 
-	if (likely(may_use_simd())) {
-		kernel_fpu_begin();
+	if (likely(nap_fpu_begin())) {
 		idx = nap_fpu_select(drv, dev, d);
-		kernel_fpu_end();
+		nap_fpu_end();
 
 		if (idx < 0)
 			idx = nap_fallback_heuristic(drv, dev);
@@ -516,10 +559,14 @@ static ssize_t version_show(struct kobject *kobj,
 static ssize_t simd_show(struct kobject *kobj,
 			 struct kobj_attribute *attr, char *buf)
 {
+#ifdef CONFIG_ARM64
+	return sysfs_emit(buf, "neon\n");
+#else
 	if (static_branch_unlikely(&nap_use_avx2))
 		return sysfs_emit(buf, "avx2\n");
 	else
 		return sysfs_emit(buf, "sse2\n");
+#endif
 }
 
 static struct kobj_attribute version_attr        = __ATTR_RO(version);

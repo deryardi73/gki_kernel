@@ -41,7 +41,11 @@ static inline float float_max(float a, float b) { return a > b ? a : b; }
  */
 static inline float nap_sqrtf(float x)
 {
+#ifdef CONFIG_ARM64
+	asm("fsqrt %s0, %s1" : "=w"(x) : "w"(x));
+#else
 	asm("sqrtss %1, %0" : "=x"(x) : "x"(x));
+#endif
 	return x;
 }
 
@@ -124,6 +128,22 @@ static inline float nap_prng_float(u32 *state)
  * ISA dispatch via static keys
  * ================================================================ */
 
+#ifdef CONFIG_ARM64
+
+static inline void nap_nn_forward(const float *input, float *output,
+				  float *hidden_save,
+				  const struct nap_weights *w)
+{
+	nap_nn_forward_neon(input, output, hidden_save, w);
+}
+
+static inline void nap_nn_learn(struct nap_cpu_data *d)
+{
+	nap_nn_learn_neon(d);
+}
+
+#else
+
 static inline void nap_nn_forward(const float *input, float *output,
 				  float *hidden_save,
 				  const struct nap_weights *w)
@@ -141,6 +161,8 @@ static inline void nap_nn_learn(struct nap_cpu_data *d)
 	else
 		nap_nn_learn_sse2(d);
 }
+
+#endif
 
 /* ================================================================
  * Weight initialization
@@ -250,6 +272,14 @@ static void logring_compute(const struct nap_cpu_data *d,
 	}
 
 	if (n == NAP_HISTORY_SIZE) {
+#ifdef CONFIG_ARM64
+		v4sf v0 = v4sf_loadu(&d->log_history[0]);
+		v4sf v1 = v4sf_loadu(&d->log_history[4]);
+
+		sum = vaddvq_f32(vaddq_f32(v0, v1));
+		s->min = vminvq_f32(vminq_f32(v0, v1));
+		s->max = vmaxvq_f32(vmaxq_f32(v0, v1));
+#else
 		v4sf v0 = *(const v4sf *)&d->log_history[0];
 		v4sf v1 = *(const v4sf *)&d->log_history[4];
 		v4sf pmin, pmax, psum, t;
@@ -277,6 +307,7 @@ static void logring_compute(const struct nap_cpu_data *d,
 		sum = psum[0];
 		s->min = pmin[0];
 		s->max = pmax[0];
+#endif
 	} else {
 		float val;
 
@@ -327,9 +358,9 @@ static void nap_extract_features(struct cpuidle_driver *drv,
 		log_inputs[3] = abs_err + 1.0f;
 
 		{
-			v4sf log_in  = *(const v4sf *)log_inputs;
-			v4sf log_out = fast_log2f_sse(log_in);
-			*(v4sf *)log_results = log_out;
+			v4sf log_in  = v4sf_loadu(log_inputs);
+			v4sf log_out = fast_log2f_v4(log_in);
+			v4sf_storeu(log_results, log_out);
 		}
 
 		out[0] = log_results[0];
@@ -383,11 +414,22 @@ static void nap_extract_features(struct cpuidle_driver *drv,
  *          to the integer heuristic.
  * ================================================================ */
 
+#ifdef CONFIG_ARM64
+static noinline void nap_fpu_reset_fpcr(void)
+{
+	asm volatile("msr fpcr, xzr" ::: "memory");
+}
+#endif
+
 int nap_fpu_select(struct cpuidle_driver *drv,
 		   struct cpuidle_device *dev,
 		   struct nap_cpu_data *d)
 {
 	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
+
+#ifdef CONFIG_ARM64
+	nap_fpu_reset_fpcr();
+#endif
 
 	/* Handle deferred weight reset (set by sysfs or nap_enable) */
 	if (unlikely(d->reset_pending)) {

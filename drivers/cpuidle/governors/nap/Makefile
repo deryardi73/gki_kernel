@@ -5,6 +5,18 @@
 
 obj-$(CONFIG_CPU_IDLE_GOV_NAP) += cpuidle_gov_nap.o
 
+ifdef CONFIG_ARM64
+
+cpuidle_gov_nap-y := nap.o nap_fpu.o nap_nn_neon.o
+
+CFLAGS_REMOVE_nap_fpu.o		+= -mgeneral-regs-only
+CFLAGS_REMOVE_nap_nn_neon.o	+= -mgeneral-regs-only
+
+CFLAGS_nap_fpu.o		+= -ffreestanding -isystem $(shell $(CC) -print-file-name=include)
+CFLAGS_nap_nn_neon.o		+= -ffreestanding -isystem $(shell $(CC) -print-file-name=include)
+
+else
+
 cpuidle_gov_nap-y := nap.o nap_fpu.o nap_nn_sse2.o nap_nn_avx2.o
 
 # Kernel builds with -mno-sse -mno-sse2 -mno-avx -msoft-float -mno-80387
@@ -28,3 +40,5 @@ CFLAGS_REMOVE_nap_nn_avx2.o    += $(FPU_KILL_FLAGS)
 CFLAGS_nap_fpu.o       += $(CC_FLAGS_FPU)
 CFLAGS_nap_nn_sse2.o   += $(CC_FLAGS_FPU)
 CFLAGS_nap_nn_avx2.o   += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma
+
+endif
