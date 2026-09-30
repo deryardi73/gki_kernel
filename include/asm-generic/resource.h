@@ -24,7 +24,7 @@
 	[RLIMIT_SIGPENDING]	= { 		0,	       0 },	\
 	[RLIMIT_MSGQUEUE]	= {   MQ_BYTES_MAX,   MQ_BYTES_MAX },	\
 	[RLIMIT_NICE]		= { 0, 0 },				\
-	[RLIMIT_RTPRIO]		= { 0, 0 },				\
+	[RLIMIT_RTPRIO]          = { 98, 98 },				\
 	[RLIMIT_RTTIME]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
 }
 
