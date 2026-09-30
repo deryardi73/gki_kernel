@@ -77,7 +77,7 @@ static void drain_openssl_errors(void)
 		}					\
 	} while(0)
 
-#ifdef USE_PKCS11_ENGINE
+#ifndef OPENSSL_IS_BORINGSSL
 static const char *key_pass;
 #endif
 static BIO *wb;
@@ -111,7 +111,7 @@ int main(int argc, char **argv)
 	if (verbose_env && strchr(verbose_env, '1'))
 		verbose = true;
 
-#ifdef USE_PKCS11_ENGINE
+#ifndef OPENSSL_IS_BORINGSSL
 	key_pass = getenv("KBUILD_SIGN_PIN");
 #endif
 
