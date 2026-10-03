@@ -306,7 +306,7 @@ static inline bool sve_vq_available(unsigned int vq) { return false; }
 static inline void sve_user_disable(void) { BUILD_BUG(); }
 static inline void sve_user_enable(void) { BUILD_BUG(); }
 
-#define sve_cond_update_zcr_vq(val, reg) do { } while (0)
+#define sve_cond_update_zcr_vq(val, reg) do { (void)(val); } while (0)
 
 static inline void vec_init_vq_map(enum vec_type t) { }
 static inline void vec_update_vq_map(enum vec_type t) { }
