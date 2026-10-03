@@ -43,7 +43,7 @@ static struct blkcg_policy_data *ssg_blkcg_cpd_alloc(gfp_t gfp)
 		return NULL;
 
 	/* no cpd_init_fn in this kernel, so set the default here */
-	ssg_blkcg->max_available_ratio = 100;
+	ssg_blkcg->max_available_ratio = 25;
 
 	return &ssg_blkcg->cpd;
 }
