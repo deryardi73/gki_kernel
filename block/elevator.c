@@ -580,7 +580,11 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
 	    !blk_mq_is_shared_tags(q->tag_set->flags))
 		return NULL;
 
+#ifdef CONFIG_DEFAULT_MQ_IOSCHED_CPQ
+	return elevator_find_get(q, "cpq");
+#else
 	return elevator_find_get(q, "mq-deadline");
+#endif
 }
 
 /*
