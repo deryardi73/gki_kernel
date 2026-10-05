@@ -56,14 +56,14 @@
 /*
  * Default tunables
  */
-static const int read_expire = HZ / 2;        /* 500ms */
-static const int write_expire = 5 * HZ;       /* 5 seconds */
-static const int writes_starved = 2;
+static const int read_expire = HZ / 10;        /* 100ms */
+static const int write_expire = 2 * HZ;       /* 2 seconds */
+static const int writes_starved = 3;
 static const int prio_aging_expire = 10 * HZ; /* 10s */
 static const int fifo_batch = 16;
 
 #define CPQ_FORE_TIMEOUT        (2 * HZ)       /* 2s */
-#define CPQ_BACK_TIMEOUT        (HZ / 8)       /* 125ms */
+#define CPQ_BACK_TIMEOUT        (1 * HZ)       /* 1s */
 #define CPQ_SLICE_IDLE          (1000000)      /* 1ms in ns */
 #define CPQ_IO_THRESHOLD        (1000000)      /* 1ms in ns */
 #define CPQ_ASYNC_DEPTH_MAX     (8)
