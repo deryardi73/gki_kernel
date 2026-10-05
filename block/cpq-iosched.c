@@ -20,8 +20,8 @@
 #include <linux/compiler.h>
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
-#include <linux/hrtimer.h>
-#include <linux/ktime.h>
+#include <linux/jiffies.h>
+#include <linux/mempool.h>
 #include <linux/ioprio.h>
 #include <linux/hashtable.h>
 
@@ -30,7 +30,6 @@
 #include "blk.h"
 #include "blk-mq.h"
 #include "blk-mq-debugfs.h"
-#include "blk-mq-tag.h"
 #include "blk-mq-sched.h"
 #include "elevator.h"
 
@@ -67,7 +66,7 @@ static const int fifo_batch = 16;
 #define CPQ_BACK_TIMEOUT        (HZ / 8)       /* 125ms */
 #define CPQ_SLICE_IDLE          (1000000)      /* 1ms in ns */
 #define CPQ_IO_THRESHOLD        (1000000)      /* 1ms in ns */
-#define CPQ_ASYNC_DEPTH         (8)
+#define CPQ_ASYNC_DEPTH_MAX     (8)
 
 /*
  * Request direction
@@ -117,14 +116,17 @@ struct cpq_data {
 	/* Hash table for request lookup */
 	DECLARE_HASHTABLE(hash, CPQ_HASH_BITS);
 
-	/* Timer */
-	struct hrtimer idle_slice_timer;
-	bool idle_slice_armed;
-
 	/* Dispatch state */
 	unsigned int batching;
 	unsigned int starved;
 	enum cpq_data_dir last_dir;
+
+	/* Group round-robin state (fore_timeout/back_timeout) */
+	unsigned int active_group;
+	unsigned long group_switch_time;
+
+	/* Last time last_dir changed (slice_idle) */
+	unsigned long dir_switch_time;
 
 	/* Tunables */
 	int fifo_expire[CPQ_DIR_COUNT];
@@ -138,11 +140,22 @@ struct cpq_data {
 	unsigned int cpq_log;
 
 	spinlock_t lock;
-	spinlock_t zone_lock;
+
+	/*
+	 * Pool for struct cpq_rq. blk_mq_request_bypass_insert() isn't
+	 * exported, so a scheduler has no safe way to hand a request
+	 * back to blk-mq if its own prepare_request() couldn't get
+	 * memory for private data - the request would be stuck forever
+	 * (no queue to sit in, never dispatched, tag never freed).
+	 * A mempool sized to the queue depth makes that allocation
+	 * fail only if more requests are already in flight than the
+	 * tag limit allows, which cannot happen.
+	 */
+	mempool_t *crq_pool;
 };
 
 /*
- * Per-request data  
+ * Per-request data
  */
 struct cpq_rq {
 	struct rb_node rb_node;
@@ -244,61 +257,10 @@ static struct request *cpq_rb_former_request(struct request_queue *q,
 }
 
 /*
- * Check if group has no more requests
- */
-static bool cpq_group_no_more_request(struct cpq_group *group)
-{
-	int i, j;
-
-	for (i = 0; i < CPQ_PRIO_LEVELS; i++) {
-		for (j = 0; j < CPQ_DIR_COUNT; j++) {
-			if (!list_empty(&group->prio[i].fifo_list[j]))
-				return false;
-			if (!RB_EMPTY_ROOT(&group->prio[i].sort_list[j]))
-				return false;
-		}
-	}
-
-	return true;
-}
-
-/*
- * Arm idle slice timer
- */
-static void cpq_arm_slice_timer(struct cpq_data *cd, struct cpq_group *group)
-{
-	ktime_t expires;
-
-	if (!cpq_group_no_more_request(group))
-		return;
-
-	if (cd->idle_slice_armed)
-		return;
-
-	expires = ns_to_ktime(cd->slice_idle);
-	hrtimer_start_range_ns(&cd->idle_slice_timer, expires,
-	                       0, HRTIMER_MODE_REL);
-	cd->idle_slice_armed = true;
-}
-
-/*
- * Timer callback
- */
-static enum hrtimer_restart cpq_idle_slice_timer(struct hrtimer *timer)
-{
-	struct cpq_data *cd = container_of(timer, struct cpq_data,
-	                                    idle_slice_timer);
-	unsigned long flags;
-
-	spin_lock_irqsave(&cd->lock, flags);
-	cd->idle_slice_armed = false;
-	spin_unlock_irqrestore(&cd->lock, flags);
-
-	return HRTIMER_NORESTART;
-}
-
-/*
- * Remove request from queues
+ * Remove request from rb tree, fifo list, rqhash and q->last_merge.
+ * Every place that pulls a request out of CPQ's own bookkeeping goes
+ * through this, so nothing is ever left reachable via the hash table
+ * or q->last_merge after the request stops being queued here.
  */
 static void cpq_remove_request(struct request_queue *q,
                                struct cpq_queue *cq,
@@ -320,6 +282,25 @@ static void cpq_remove_request(struct request_queue *q,
 }
 
 /*
+ * True if group has any pending request, at any priority/direction.
+ */
+static bool cpq_group_has_work(struct cpq_data *cd, unsigned int group)
+{
+	int j, k;
+
+	for (j = 0; j < CPQ_PRIO_LEVELS; j++) {
+		struct cpq_queue *cq = &cd->groups[group].prio[j];
+
+		for (k = 0; k < CPQ_DIR_COUNT; k++) {
+			if (!list_empty(&cq->fifo_list[k]))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
  * Dispatch request with deadline and aging consideration
  */
 static struct request *cpq_dispatch_request_from_queue(struct cpq_data *cd,
@@ -328,10 +309,48 @@ static struct request *cpq_dispatch_request_from_queue(struct cpq_data *cd,
 {
 	struct request *rq = NULL;
 	struct cpq_rq *crq;
-	int dir;
+	int order[CPQ_DIR_COUNT];
+	int dir, k;
+	bool queue_hot;
 
-	/* Check both read and write queues */
-	for (dir = 0; dir < CPQ_DIR_COUNT; dir++) {
+	/* io_threshold gates the fast path: only a queue we issued from
+	 * recently gets to skip straight to next_rq. 0 disables it. */
+	queue_hot = cd->io_threshold &&
+	            cq->last_issue &&
+	            time_before(now, cq->last_issue +
+	                         nsecs_to_jiffies(cd->io_threshold));
+
+	if (queue_hot && cd->batching < cd->fifo_batch && cq->next_rq[cd->last_dir]) {
+		dir = cd->last_dir;
+		rq = cq->next_rq[dir];
+		cq->next_rq[dir] = elv_rb_latter_request(rq->q, rq);
+		cpq_remove_request(rq->q, cq, rq);
+		cq->dispatched++;
+		goto found;
+	}
+
+	/*
+	 * Decide which direction to try first. Writes are starved of
+	 * service by default (reads are always tried first below), so
+	 * once cd->starved reaches cd->writes_starved we flip the order
+	 * for this dispatch and let a write through. slice_idle damps
+	 * that flip so it can't fire more than once per slice_idle.
+	 */
+	if (!list_empty(&cq->fifo_list[CPQ_WRITE]) &&
+	    (list_empty(&cq->fifo_list[CPQ_READ]) ||
+	     (cd->starved >= cd->writes_starved &&
+	      time_after_eq(now, cd->dir_switch_time +
+	                    nsecs_to_jiffies(cd->slice_idle))))) {
+		order[0] = CPQ_WRITE;
+		order[1] = CPQ_READ;
+	} else {
+		order[0] = CPQ_READ;
+		order[1] = CPQ_WRITE;
+	}
+
+	for (k = 0; k < CPQ_DIR_COUNT; k++) {
+		dir = order[k];
+
 		if (list_empty(&cq->fifo_list[dir]))
 			continue;
 
@@ -339,20 +358,29 @@ static struct request *cpq_dispatch_request_from_queue(struct cpq_data *cd,
 		rq = rq_entry_fifo(cq->fifo_list[dir].next);
 		crq = rq->elv.priv[0];
 
-		if (!crq)
-			continue;
+		/*
+		 * crq is only missing when prepare_request()'s mempool_alloc()
+		 * failed (see there - should not be reachable in practice).
+		 * Skip straight to the rb-tree attempt below rather than
+		 * dereferencing it; that path doesn't need crq, so the
+		 * request still gets dispatched instead of sitting in
+		 * fifo_list forever.
+		 */
+		if (crq) {
+			/* Check if deadline expired or aged */
+			if (time_after_eq(now, crq->deadline)) {
+				cd->batching = 0;
+				cq->next_rq[dir] = elv_rb_latter_request(rq->q, rq);
+				cpq_remove_request(rq->q, cq, rq);
+				cq->dispatched++;
+				goto found;
+			}
 
-		/* Check if deadline expired or aged */
-		if (time_after_eq(now, crq->deadline)) {
-			cpq_remove_request(rq->q, cq, rq);
-			cq->dispatched++;
-			return rq;
-		}
-
-		/* Check priority aging */
-		if (cd->prio_aging_expire && !crq->aged &&
-		    time_after_eq(now, crq->issue_time + cd->prio_aging_expire)) {
-			crq->aged = 1;
+			/* Check priority aging */
+			if (cd->prio_aging_expire && !crq->aged &&
+			    time_after_eq(now, crq->issue_time + cd->prio_aging_expire)) {
+				crq->aged = 1;
+			}
 		}
 
 		/* Try sector-ordered dispatch from rbtree */
@@ -361,9 +389,65 @@ static struct request *cpq_dispatch_request_from_queue(struct cpq_data *cd,
 
 			if (node) {
 				rq = rb_entry_rq(node);
+				cd->batching = 0;
+				cq->next_rq[dir] = elv_rb_latter_request(rq->q, rq);
 				cpq_remove_request(rq->q, cq, rq);
 				cq->dispatched++;
-				return rq;
+				goto found;
+			}
+		}
+	}
+
+	return NULL;
+
+found:
+	if (dir == CPQ_WRITE)
+		cd->starved = 0;
+	else if (!list_empty(&cq->fifo_list[CPQ_WRITE]))
+		cd->starved++;
+
+	if (dir != cd->last_dir)
+		cd->dir_switch_time = now;
+
+	cd->last_dir = dir;
+	cq->last_issue = now;
+	return rq;
+}
+
+/*
+ * Scan for requests that have aged past cd->prio_aging_expire in a
+ * lower-than-RT queue and dispatch them ahead of strict group/priority
+ * order, so continuous RT traffic can't starve BE/IDLE indefinitely.
+ */
+static struct request *cpq_dispatch_aged_requests(struct cpq_data *cd,
+                                                   unsigned long now)
+{
+	struct request *rq;
+	struct cpq_rq *crq;
+	int i, j, dir;
+
+	for (i = 0; i < CPQ_GROUPS; i++) {
+		for (j = CPQ_PRIO_BE; j <= CPQ_PRIO_IDLE; j++) {
+			struct cpq_queue *cq = &cd->groups[i].prio[j];
+
+			for (dir = 0; dir < CPQ_DIR_COUNT; dir++) {
+				if (list_empty(&cq->fifo_list[dir]))
+					continue;
+
+				rq = rq_entry_fifo(cq->fifo_list[dir].next);
+				crq = rq->elv.priv[0];
+				if (!crq)
+					continue;
+
+				if (cd->prio_aging_expire && !crq->aged &&
+				    time_after_eq(now, crq->issue_time + cd->prio_aging_expire))
+					crq->aged = 1;
+
+				if (crq->aged) {
+					cpq_remove_request(rq->q, cq, rq);
+					cq->dispatched++;
+					return rq;
+				}
 			}
 		}
 	}
@@ -386,6 +470,15 @@ static int cpq_init_sched(struct request_queue *q, struct elevator_type *e)
 
 	cd = kzalloc(sizeof(*cd), GFP_KERNEL);
 	if (!cd) {
+		kobject_put(&eq->kobj);
+		return -ENOMEM;
+	}
+
+	cd->crq_pool = mempool_create_kmalloc_pool(
+		max_t(unsigned int, q->nr_requests, BLKDEV_DEFAULT_RQ),
+		sizeof(struct cpq_rq));
+	if (!cd->crq_pool) {
+		kfree(cd);
 		kobject_put(&eq->kobj);
 		return -ENOMEM;
 	}
@@ -416,17 +509,15 @@ static int cpq_init_sched(struct request_queue *q, struct elevator_type *e)
 	cd->groups[CPQ_GROUP_BG].timeout = CPQ_BACK_TIMEOUT;
 
 	spin_lock_init(&cd->lock);
-	spin_lock_init(&cd->zone_lock);
-
-	/* Initialize timer */
-	hrtimer_init(&cd->idle_slice_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	cd->idle_slice_timer.function = cpq_idle_slice_timer;
-	cd->idle_slice_armed = false;
 
 	/* Initialize dispatch state */
 	cd->batching = 0;
 	cd->starved = 0;
 	cd->last_dir = CPQ_WRITE;
+
+	cd->active_group = CPQ_GROUP_FG;
+	cd->group_switch_time = jiffies;
+	cd->dir_switch_time = jiffies;
 
 	/* Set tunables */
 	cd->fifo_expire[CPQ_READ] = read_expire;
@@ -437,13 +528,11 @@ static int cpq_init_sched(struct request_queue *q, struct elevator_type *e)
 	cd->prio_aging_expire = prio_aging_expire;
 	cd->slice_idle = CPQ_SLICE_IDLE;
 	cd->io_threshold = CPQ_IO_THRESHOLD;
-	cd->async_depth = CPQ_ASYNC_DEPTH;
+	cd->async_depth = CPQ_ASYNC_DEPTH_MAX;
 	cd->cpq_log = 0;
 
 	eq->elevator_data = cd;
 	q->elevator = eq;
-
-	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
 
 	return 0;
 }
@@ -456,8 +545,6 @@ static void cpq_exit_sched(struct elevator_queue *e)
 	struct cpq_data *cd = e->elevator_data;
 	int i, j;
 
-	hrtimer_cancel(&cd->idle_slice_timer);
-
 	/* Verify queues are empty */
 	for (i = 0; i < CPQ_GROUPS; i++) {
 		for (j = 0; j < CPQ_PRIO_LEVELS; j++) {
@@ -468,7 +555,49 @@ static void cpq_exit_sched(struct elevator_queue *e)
 		}
 	}
 
+	mempool_destroy(cd->crq_pool);
 	kfree(cd);
+}
+
+/*
+ * 'depth' is a number in the range 1..INT_MAX representing a number of
+ * requests. Scale it with a factor (1 << bt->sb.shift) / q->nr_requests
+ * since 1..(1 << bt->sb.shift) is the range expected by
+ * sbitmap_get_shallow(). Mirrors mq-deadline's dd_to_word_depth(); the
+ * upstream CPQ assigned async_depth to shallow_depth unscaled, which
+ * is wrong relative to what sbitmap_get_shallow() actually expects.
+ */
+static int cpq_to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth)
+{
+	struct sbitmap_queue *bt = &hctx->sched_tags->bitmap_tags;
+	const unsigned int nrr = hctx->queue->nr_requests;
+
+	return ((qdepth << bt->sb.shift) + nrr - 1) / nrr;
+}
+
+/*
+ * Compute async_depth from the current nr_requests. Called from
+ * init_hctx() and from depth_updated() whenever nr_requests changes
+ * via sysfs (blk_mq_update_nr_requests()).
+ */
+static void cpq_depth_updated(struct blk_mq_hw_ctx *hctx)
+{
+	struct cpq_data *cd = hctx->queue->elevator->elevator_data;
+	unsigned int depth = hctx->queue->nr_requests;
+	unsigned int shallow_depth = depth / 4;
+
+	if (shallow_depth == 0)
+		shallow_depth = 1;
+	else if (shallow_depth > CPQ_ASYNC_DEPTH_MAX)
+		shallow_depth = CPQ_ASYNC_DEPTH_MAX;
+
+	cd->async_depth = shallow_depth;
+	sbitmap_queue_min_shallow_depth(&hctx->sched_tags->bitmap_tags, 1);
+
+	/* Keep the crq pool at least as large as the queue can get deep;
+	 * mempool_resize() only grows/shrinks the reserve, in-flight
+	 * elements already allocated from it are unaffected. */
+	mempool_resize(cd->crq_pool, depth);
 }
 
 /*
@@ -476,26 +605,8 @@ static void cpq_exit_sched(struct elevator_queue *e)
  */
 static int cpq_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
 {
-	struct cpq_data *cd = hctx->queue->elevator->elevator_data;
-	unsigned int depth = hctx->queue->nr_requests;
-	unsigned int shallow_depth = (depth * 3) / 4;
-
-	if (shallow_depth == 0)
-		shallow_depth = 1;
-
-	cd->async_depth = shallow_depth;
-	sbitmap_queue_min_shallow_depth(&hctx->sched_tags->bitmap_tags,
-	                                 shallow_depth);
-
+	cpq_depth_updated(hctx);
 	return 0;
-}
-
-/*
- * Depth updated
- */
-static void cpq_depth_updated(struct blk_mq_hw_ctx *hctx)
-{
-	cpq_init_hctx(hctx, hctx->queue_num);
 }
 
 /*
@@ -508,7 +619,7 @@ static void cpq_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)
 	if (op_is_sync(opf))
 		return;
 
-	data->shallow_depth = cd->async_depth;
+	data->shallow_depth = cpq_to_word_depth(data->hctx, cd->async_depth);
 }
 
 /*
@@ -516,14 +627,23 @@ static void cpq_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)
  */
 static void cpq_prepare_request(struct request *rq)
 {
+	struct cpq_data *cd = rq->q->elevator->elevator_data;
 	struct cpq_rq *crq;
 
-	crq = kzalloc(sizeof(*crq), GFP_ATOMIC);
-	if (!crq) {
+	crq = mempool_alloc(cd->crq_pool, GFP_ATOMIC);
+	if (WARN_ON_ONCE(!crq)) {
+		/*
+		 * Should not be reachable: the pool is sized to the queue
+		 * depth, and a request can only get here by having already
+		 * been allocated a tag, which bounds concurrent callers to
+		 * that same depth. Leave priv[0] NULL; every site that
+		 * reads it already handles that case.
+		 */
 		rq->elv.priv[0] = NULL;
 		return;
 	}
 
+	memset(crq, 0, sizeof(*crq));
 	RB_CLEAR_NODE(&crq->rb_node);
 	INIT_LIST_HEAD(&crq->fifo);
 	INIT_HLIST_NODE(&crq->hash);
@@ -553,51 +673,75 @@ static void cpq_finish_request(struct request *rq)
 		cd = rq->q->elevator->elevator_data;
 		cq = &cd->groups[crq->group].prio[crq->prio];
 		atomic_inc(&cq->completed);
+		mempool_free(crq, cd->crq_pool);
+	} else {
+		/*
+		 * No elevator_data to find the pool through (shouldn't
+		 * normally happen - finish_request only runs on requests
+		 * this scheduler prepared). Leak the one object rather
+		 * than guess which pool it came from.
+		 */
+		WARN_ON_ONCE(1);
 	}
 
-	kfree(crq);
 	rq->elv.priv[0] = NULL;
 }
 
 /*
- * Insert requests
+ * Insert requests. A request whose cpq_rq failed to allocate (crq ==
+ * NULL, prepare_request() hit -ENOMEM) is bypass-inserted straight to
+ * the hardware dispatch list instead of being silently skipped: the
+ * list this function is handed is expected to be fully consumed, and
+ * a request left neither queued here nor bypass-inserted would never
+ * be dispatched, completed, or freed again.
  */
 static void cpq_insert_requests(struct blk_mq_hw_ctx *hctx,
-                                struct list_head *list, bool at_head)
+                                struct list_head *list, blk_insert_t flags)
 {
 	struct request_queue *q = hctx->queue;
 	struct cpq_data *cd = q->elevator->elevator_data;
 	struct request *rq, *next;
-	unsigned long flags;
 
-	spin_lock_irqsave(&cd->lock, flags);
+	spin_lock(&cd->lock);
 
 	list_for_each_entry_safe(rq, next, list, queuelist) {
 		struct cpq_rq *crq = rq->elv.priv[0];
 		const enum cpq_data_dir dir = rq_data_dir(rq);
 		struct cpq_queue *cq;
 
-		if (!crq)
-			continue;
-
-		cq = &cd->groups[crq->group].prio[crq->prio];
-
 		list_del_init(&rq->queuelist);
 
-		cpq_add_rq_rb(cq, rq);
-
-		if (rq_mergeable(rq)) {
-			elv_rqhash_add(q, rq);
-			hash_add(cd->hash, &crq->hash, blk_rq_pos(rq));
+		if (crq) {
+			cq = &cd->groups[crq->group].prio[crq->prio];
+			cpq_add_rq_rb(cq, rq);
+			if (rq_mergeable(rq))
+				hash_add(cd->hash, &crq->hash, blk_rq_pos(rq));
+			crq->deadline = jiffies + cd->fifo_expire[dir];
+		} else {
+			/*
+			 * prepare_request()'s mempool_alloc() failed (should
+			 * not be reachable, see cpq_prepare_request()). Still
+			 * queue the request under a default classification
+			 * instead of dropping it - cpq_dispatch_request_from_queue()
+			 * can dispatch a crq-less request via the rb-tree path,
+			 * so it will still complete, just without priority
+			 * tracking, aging, or the FIFO-deadline/front-merge fast
+			 * paths that need crq.
+			 */
+			cq = &cd->groups[cpq_determine_group(rq)]
+			            .prio[cpq_ioprio_class_to_prio(cpq_rq_ioclass(rq))];
+			elv_rb_add(&cq->sort_list[dir], rq);
 		}
+
+		if (rq_mergeable(rq))
+			elv_rqhash_add(q, rq);
 
 		if (!q->last_merge)
 			q->last_merge = rq;
 
 		rq->fifo_time = jiffies + cd->fifo_expire[dir];
-		crq->deadline = rq->fifo_time;
 
-		if (at_head)
+		if (flags & BLK_MQ_INSERT_AT_HEAD)
 			list_add(&rq->queuelist, &cq->fifo_list[dir]);
 		else
 			list_add_tail(&rq->queuelist, &cq->fifo_list[dir]);
@@ -605,13 +749,7 @@ static void cpq_insert_requests(struct blk_mq_hw_ctx *hctx,
 		cq->inserted++;
 	}
 
-	/* Cancel timer on new request */
-	if (cd->idle_slice_armed) {
-		hrtimer_try_to_cancel(&cd->idle_slice_timer);
-		cd->idle_slice_armed = false;
-	}
-
-	spin_unlock_irqrestore(&cd->lock, flags);
+	spin_unlock(&cd->lock);
 }
 
 /*
@@ -622,40 +760,66 @@ static struct request *cpq_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	struct request_queue *q = hctx->queue;
 	struct cpq_data *cd = q->elevator->elevator_data;
 	struct request *rq = NULL;
-	unsigned long flags;
 	unsigned long now = jiffies;
-	int i, j;
+	unsigned int group_order[CPQ_GROUPS];
+	unsigned int active, other, gi, i, j;
+	bool active_timed_out;
 
-	spin_lock_irqsave(&cd->lock, flags);
+	spin_lock(&cd->lock);
+
+	/* Requests that aged past prio_aging_expire bypass strict order */
+	rq = cpq_dispatch_aged_requests(cd, now);
+	if (rq) {
+		cd->batching++;
+		goto out;
+	}
+
+	/* FG serviced first by default; once it holds past its own
+	 * fore_timeout/back_timeout and BG actually has work, let BG in. */
+	active = cd->active_group;
+	other = active ^ 1;
+	active_timed_out = time_after_eq(now, cd->group_switch_time +
+	                                  cd->groups[active].timeout);
+
+	if (active_timed_out && cpq_group_has_work(cd, other)) {
+		group_order[0] = other;
+		group_order[1] = active;
+	} else {
+		group_order[0] = active;
+		group_order[1] = other;
+	}
 
 	/* Try to dispatch from queues with priority and aging */
-	for (i = 0; i < CPQ_GROUPS; i++) {
+	for (gi = 0; gi < CPQ_GROUPS; gi++) {
+		i = group_order[gi];
+
 		for (j = 0; j < CPQ_PRIO_LEVELS; j++) {
 			struct cpq_queue *cq = &cd->groups[i].prio[j];
 
 			rq = cpq_dispatch_request_from_queue(cd, cq, now);
 			if (rq) {
+				if (i != cd->active_group) {
+					cd->groups[cd->active_group].starved++;
+					cd->active_group = i;
+					cd->group_switch_time = now;
+					cd->groups[i].batched = 0;
+				} else {
+					cd->groups[i].batched++;
+				}
+
 				cd->batching++;
 
 				/* Check for batching limit */
-				if (cd->batching >= cd->fifo_batch) {
+				if (cd->batching >= cd->fifo_batch)
 					cd->batching = 0;
-				}
 
 				goto out;
 			}
 		}
 	}
 
-	/* No requests found, arm timer if appropriate */
-	if (!rq && !cd->idle_slice_armed) {
-		if (cpq_group_no_more_request(&cd->groups[CPQ_GROUP_FG])) {
-			cpq_arm_slice_timer(cd, &cd->groups[CPQ_GROUP_FG]);
-		}
-	}
-
 out:
-	spin_unlock_irqrestore(&cd->lock, flags);
+	spin_unlock(&cd->lock);
 	return rq;
 }
 
@@ -677,6 +841,28 @@ static bool cpq_has_work(struct blk_mq_hw_ctx *hctx)
 	}
 
 	return false;
+}
+
+/*
+ * Bio merge - opportunistic front/back merge at bio submission time,
+ * before a request is allocated. Without this hook blk_mq_sched_bio_merge()
+ * always returns false and every bio ends up as its own request.
+ */
+static bool cpq_bio_merge(struct request_queue *q, struct bio *bio,
+                          unsigned int nr_segs)
+{
+	struct cpq_data *cd = q->elevator->elevator_data;
+	struct request *free = NULL;
+	bool ret;
+
+	spin_lock(&cd->lock);
+	ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
+	spin_unlock(&cd->lock);
+
+	if (free)
+		blk_mq_free_request(free);
+
+	return ret;
 }
 
 /*
@@ -702,7 +888,15 @@ static int cpq_request_merge(struct request_queue *q, struct request **req,
 
 		__rq = cpq_find_rq_rb(cq, sector, dir);
 		if (__rq) {
-			BUG_ON(sector != blk_rq_pos(__rq));
+			/*
+			 * elv_rb_find() indexes sort_list by end-sector, so a
+			 * hit here should always have __rq's start sector
+			 * equal to our search key. A mismatch means the
+			 * rb-tree is corrupt - warn and refuse the merge
+			 * rather than taking the whole kernel down over it.
+			 */
+			if (WARN_ON_ONCE(sector != blk_rq_pos(__rq)))
+				return ELEVATOR_NO_MERGE;
 			if (elv_bio_merge_ok(__rq, bio)) {
 				*req = __rq;
 				if (blk_discard_mergable(__rq))
@@ -737,7 +931,10 @@ static void cpq_request_merged(struct request_queue *q, struct request *req,
 }
 
 /*
- * Requests merged
+ * Requests merged. next is going away (the caller frees it once this
+ * returns), so it must come out through cpq_remove_request() - the
+ * full removal, not just the rb-tree - or it stays reachable through
+ * the rqhash / q->last_merge after it's freed.
  */
 static void cpq_merged_requests(struct request_queue *q, struct request *rq,
                                 struct request *next)
@@ -751,10 +948,7 @@ static void cpq_merged_requests(struct request_queue *q, struct request *rq,
 
 	cq = &cd->groups[crq_next->group].prio[crq_next->prio];
 
-	if (!list_empty(&next->queuelist))
-		list_del_init(&next->queuelist);
-
-	cpq_del_rq_rb(cq, next);
+	cpq_remove_request(q, cq, next);
 	cq->merged++;
 }
 
@@ -768,7 +962,7 @@ static ssize_t __FUNC(struct elevator_queue *e, char *page)           \
 	int __data = __VAR;                                            \
 	if (__CONV)                                                    \
 		__data = jiffies_to_msecs(__data);                     \
-	return sysfs_emit(page, "%d\n", __data);                     \
+	return sysfs_emit(page, "%d\n", __data);                       \
 }
 
 #define STORE_FUNCTION(__FUNC, __PTR, MIN, MAX, __CONV)                \
@@ -946,10 +1140,9 @@ static struct elevator_type cpq_mq = {
 		.dispatch_request = cpq_dispatch_request,
 		.prepare_request = cpq_prepare_request,
 		.finish_request = cpq_finish_request,
-		.next_request = elv_rb_latter_request,
-		.former_request = elv_rb_former_request,
 		.next_request = cpq_rb_latter_request,
 		.former_request = cpq_rb_former_request,
+		.bio_merge = cpq_bio_merge,
 		.request_merge = cpq_request_merge,
 		.requests_merged = cpq_merged_requests,
 		.request_merged = cpq_request_merged,
