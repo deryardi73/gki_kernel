@@ -29,6 +29,7 @@ ssg-$(CONFIG_MQ_IOSCHED_SSG)	:= ssg-iosched.o ssg-stat.o
 ssg-$(CONFIG_MQ_IOSCHED_SSG_CGROUP)	+= ssg-cgroup.o
 ssg-$(CONFIG_MQ_IOSCHED_SSG_WB) += ssg-wb.o
 obj-$(CONFIG_MQ_IOSCHED_SSG)	+= ssg.o
+obj-$(CONFIG_MQ_IOSCHED_CPQ)	+= cpq-iosched.o
 
 obj-$(CONFIG_BLK_DEV_INTEGRITY) += bio-integrity.o blk-integrity.o
 obj-$(CONFIG_BLK_DEV_INTEGRITY_T10)	+= t10-pi.o

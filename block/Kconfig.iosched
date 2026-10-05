@@ -65,4 +65,20 @@ config MQ_IOSCHED_SSG_WB
 	help
 	  Write Booster for SamSung Generic IO scheduler.
 
+config MQ_IOSCHED_CPQ
+	tristate "CPQ I/O scheduler"
+	default n
+	help
+	  CPQ (Custom Priority Queue) I/O scheduler for the blk-mq
+	  scheduling framework. Combines priority-aware dispatch
+	  (mapped from ioprio) with foreground/background group
+	  separation, targeting mobile and embedded flash storage.
+
+config DEFAULT_MQ_IOSCHED_CPQ
+	bool "Enable CPQ I/O scheduler as default MQ I/O scheduler"
+	depends on MQ_IOSCHED_CPQ=y
+	default n
+	help
+	  Enable CPQ I/O scheduler as default MQ I/O scheduler.
+
 endmenu
