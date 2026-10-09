@@ -60,6 +60,10 @@
 #include <trace/hooks/sched.h>
 #include <trace/hooks/dtask.h>
 
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif /* CONFIG_SCHED_BORE */
+
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
 
 /*
@@ -87,18 +91,31 @@ EXPORT_SYMBOL_GPL(sysctl_sched_latency);
  *   SCHED_TUNABLESCALING_LOG - scaled logarithmical, *1+ilog(ncpus)
  *   SCHED_TUNABLESCALING_LINEAR - scaled linear, *ncpus
  *
- * (default SCHED_TUNABLESCALING_LOG = *(1+ilog(ncpus))
+ * BORE : default SCHED_TUNABLESCALING_NONE = *1 constant
+ * EEVDF: default SCHED_TUNABLESCALING_LOG  = *(1+ilog(ncpus))
  */
+#ifdef CONFIG_SCHED_BORE
+unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_NONE;
+#else /* !CONFIG_SCHED_BORE */
 unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
+#endif /* CONFIG_SCHED_BORE */
 
 /*
  * Minimal preemption granularity for CPU-bound tasks:
  *
- * (default: 0.70 msec * (1 + ilog(ncpus)), units: nanoseconds)
+ * BORE : base_slice = minimum multiple of nsecs_per_tick >= min_base_slice
+ * (default min_base_slice = 2000000 constant, units: nanoseconds)
+ * EEVDF: default 0.70 msec * (1 + ilog(ncpus)), units: nanoseconds
  */
+#ifdef CONFIG_SCHED_BORE
+static const unsigned int nsecs_per_tick       = 1000000000ULL / HZ;
+unsigned int sysctl_sched_min_base_slice       = CONFIG_MIN_BASE_SLICE_NS;
+__read_mostly uint sysctl_sched_base_slice     = nsecs_per_tick;
+#else /* !CONFIG_SCHED_BORE */
 unsigned int sysctl_sched_base_slice			= 700000ULL;
-EXPORT_SYMBOL_GPL(sysctl_sched_base_slice);
 static unsigned int normalized_sysctl_sched_base_slice	= 700000ULL;
+#endif /* CONFIG_SCHED_BORE */
+EXPORT_SYMBOL_GPL(sysctl_sched_base_slice);
 
 /*
  * After fork, child runs first. If set to 0 (default) then
@@ -232,6 +249,13 @@ static inline void update_load_set(struct load_weight *lw, unsigned long w)
  *
  * This idea comes from the SD scheduler of Con Kolivas:
  */
+#ifdef CONFIG_SCHED_BORE
+static void update_sysctl(void) {
+	sysctl_sched_base_slice = nsecs_per_tick *
+		max(1UL, DIV_ROUND_UP(sysctl_sched_min_base_slice, nsecs_per_tick));
+}
+void sched_update_min_base_slice(void) { update_sysctl(); }
+#else /* !CONFIG_SCHED_BORE */
 static unsigned int get_update_sysctl_factor(void)
 {
 	unsigned int cpus = min_t(unsigned int, num_online_cpus(), 8);
@@ -262,6 +286,7 @@ static void update_sysctl(void)
 	SET_SYSCTL(sched_base_slice);
 #undef SET_SYSCTL
 }
+#endif /* CONFIG_SCHED_BORE */
 
 void __init sched_init_granularity(void)
 {
@@ -739,6 +764,10 @@ static s64 entity_lag(u64 avruntime, struct sched_entity *se)
 
 	vlag = avruntime - se->vruntime;
 	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
+#ifdef CONFIG_SCHED_BORE
+	if (static_branch_likely(&sched_bore_key))
+		limit >>= 1;
+#endif /* CONFIG_SCHED_BORE */
 
 	return clamp(vlag, -limit, limit);
 }
@@ -941,8 +970,17 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 	 * Once selected, run a task until it either becomes non-eligible or
 	 * until it gets a new slice. See the HACK in set_next_entity().
 	 */
-	if (sched_feat(RUN_TO_PARITY) && curr && curr->vlag == curr->deadline)
-		return curr;
+	if (sched_feat(RUN_TO_PARITY) && curr && curr->vlag == curr->deadline) {
+#ifdef CONFIG_SCHED_BORE
+		if (static_branch_likely(&sched_bore_key)) {
+			if ((static_branch_likely(&sched_burst_protect_slice_cond_key) ||
+			     static_branch_unlikely(&sched_burst_protect_slice_prefer_key)) &&
+			    (!entity_is_task(curr) || !bore_futex_waiting(task_of(curr))))
+				return curr;
+		} else
+#endif /* CONFIG_SCHED_BORE */
+			return curr;
+	}
 
 	/* Pick the leftmost entity if it's eligible */
 	if (se && entity_eligible(cfs_rq, se)) {
@@ -1006,6 +1044,7 @@ struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
  * Scheduling class statistics methods:
  */
 #ifdef CONFIG_SMP
+#if !defined(CONFIG_SCHED_BORE)
 int sched_update_scaling(void)
 {
 	unsigned int factor = get_update_sysctl_factor();
@@ -1017,6 +1056,7 @@ int sched_update_scaling(void)
 
 	return 0;
 }
+#endif /* CONFIG_SCHED_BORE */
 #endif
 #endif
 
@@ -1171,6 +1211,37 @@ static void update_tg_load_avg(struct cfs_rq *cfs_rq)
 /*
  * Update the current task's runtime statistics.
  */
+#ifdef CONFIG_SCHED_BORE
+static inline bool do_preempt_weight(struct cfs_rq *cfs_rq,
+				     struct sched_entity *pse, struct sched_entity *se)
+{
+	if (!sched_feat(RUN_TO_PARITY))
+		return false;
+
+	if (!static_branch_likely(&sched_bore_key))
+		return false;
+
+	if (!static_branch_likely(&sched_burst_protect_slice_cond_key))
+		return false;
+
+	if (static_branch_unlikely(&sched_burst_protect_slice_prefer_key)
+			? (pse->load.weight <= se->load.weight)
+			: (pse->load.weight <  se->load.weight))
+		return false;
+
+	if (!entity_eligible(cfs_rq, pse))
+		return false;
+
+	if (entity_before(pse, se))
+		return true;
+
+	if (!entity_eligible(cfs_rq, se))
+		return true;
+
+	return false;
+}
+#endif /* CONFIG_SCHED_BORE */
+
 static void update_curr(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
@@ -1204,6 +1275,9 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	if (entity_is_task(curr)) {
 		struct task_struct *curtask = task_of(curr);
 
+#ifdef CONFIG_SCHED_BORE
+		update_curr_bore(curtask, delta_exec);
+#endif /* CONFIG_SCHED_BORE */
 		trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
 		cgroup_account_cputime(curtask, delta_exec);
 		account_group_exec_runtime(curtask, delta_exec);
@@ -3841,7 +3915,7 @@ static void reweight_eevdf(struct sched_entity *se, u64 avruntime,
 	se->deadline = avruntime + vslice;
 }
 
-static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
 	bool curr = cfs_rq->curr == se;
@@ -5292,6 +5366,14 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	se->vruntime = vruntime - lag;
 
+#ifdef CONFIG_SCHED_BORE
+	if (static_branch_likely(&sched_bore_key)) {
+		if (entity_is_task(se) && bore_futex_waiting(task_of(se)))
+			vslice = 0;
+		else
+			vslice >>= !!(flags & (ENQUEUE_INITIAL | ENQUEUE_WAKEUP));
+	} else
+#endif /* CONFIG_SCHED_BORE */
 	/*
 	 * When joining the competition; the exisiting tasks will be,
 	 * on average, halfway through their slice, as such start tasks
@@ -5304,6 +5386,17 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * EEVDF: vd_i = ve_i + r_i/w_i
 	 */
 	se->deadline = se->vruntime + vslice;
+
+#ifdef CONFIG_SCHED_BORE
+	if (static_branch_likely(&sched_bore_key) &&
+	    static_branch_unlikely(&sched_credit_key) &&
+	    entity_is_task(se) && (flags & ENQUEUE_WAKEUP)) {
+		u64 credit = bore_credit_ns(task_of(se));
+
+		if (credit && se->deadline > credit)
+			se->deadline -= credit;
+	}
+#endif /* CONFIG_SCHED_BORE */
 	trace_android_rvh_place_entity(cfs_rq, se, flags, &vruntime);
 }
 
@@ -6883,6 +6976,16 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 	util_est_dequeue(&rq->cfs, p);
 
+#ifdef CONFIG_SCHED_BORE
+	if (task_sleep) {
+		cfs_rq = cfs_rq_of(se);
+		if (cfs_rq->curr == se)
+			update_curr(cfs_rq);
+		bore_note_sleep(p, rq_clock(rq));
+		restart_burst_bore(p);
+	}
+#endif /* CONFIG_SCHED_BORE */
+
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		dequeue_entity(cfs_rq, se, flags);
@@ -8439,6 +8542,12 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	if (ignore)
 		return;
 
+#ifdef CONFIG_SCHED_BORE
+	/* cancel the run-to-parity protection of @se, see pick_eevdf() */
+	if (do_preempt_weight(cfs_rq, pse, se) && se->vlag == se->deadline)
+		se->vlag = se->deadline + 1;
+#endif /* CONFIG_SCHED_BORE */
+
 	/*
 	 * XXX pick_eevdf(cfs_rq) != se ?
 	 */
@@ -8669,16 +8778,25 @@ static void yield_task_fair(struct rq *rq)
 	/*
 	 * Are we the only task in the tree?
 	 */
+#if !defined(CONFIG_SCHED_BORE)
 	if (unlikely(rq->nr_running == 1))
 		return;
 
 	clear_buddies(cfs_rq, se);
+#endif /* CONFIG_SCHED_BORE */
 
 	update_rq_clock(rq);
 	/*
 	 * Update run-time statistics of the 'current'.
 	 */
 	update_curr(cfs_rq);
+#ifdef CONFIG_SCHED_BORE
+	restart_burst_rescale_deadline_bore(curr);
+	if (unlikely(rq->nr_running == 1))
+		return;
+
+	clear_buddies(cfs_rq, se);
+#endif /* CONFIG_SCHED_BORE */
 	/*
 	 * Tell update_rq_clock() that we've just updated,
 	 * so we don't do microscopic update in schedule()
@@ -12892,6 +13010,9 @@ static void switched_from_fair(struct rq *rq, struct task_struct *p)
 static void switched_to_fair(struct rq *rq, struct task_struct *p)
 {
 	attach_task_cfs_rq(p);
+#ifdef CONFIG_SCHED_BORE
+	reset_task_bore(p);
+#endif /* CONFIG_SCHED_BORE */
 
 	if (task_on_rq_queued(p)) {
 		/*
