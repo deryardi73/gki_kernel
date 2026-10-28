@@ -869,7 +869,10 @@ static bool folio_referenced_one(struct folio *folio,
 				referenced++;
 			}
 
-			if (ptep_clear_flush_young_notify(vma, address,
+			if (lru_cast_enabled()) {
+				if (lru_cast_look_around(&pvmw))
+					referenced++;
+			} else if (ptep_clear_flush_young_notify(vma, address,
 						pvmw.pte))
 				referenced++;
 		} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {

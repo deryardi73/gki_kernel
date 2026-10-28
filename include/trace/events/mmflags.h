@@ -96,6 +96,12 @@
 #define IF_HAVE_PG_ARCH_X(_name)
 #endif
 
+#ifdef CONFIG_LRU_CAST
+#define IF_HAVE_PG_REKEY(_name) ,{1UL << PG_##_name, __stringify(_name)}
+#else
+#define IF_HAVE_PG_REKEY(_name)
+#endif
+
 #ifdef CONFIG_64BIT
 #define IF_HAVE_PG_OEM_RESERVED(_name) ,{1UL << PG_##_name, __stringify(_name)}
 #else
@@ -137,7 +143,8 @@ IF_HAVE_PG_OEM_RESERVED(oem_reserved_1)					\
 IF_HAVE_PG_OEM_RESERVED(oem_reserved_2)					\
 IF_HAVE_PG_OEM_RESERVED(oem_reserved_3)					\
 IF_HAVE_PG_OEM_RESERVED(oem_reserved_4)					\
-IF_HAVE_PG_OEM_RESERVED(oem_reserved_5)
+IF_HAVE_PG_OEM_RESERVED(oem_reserved_5)					\
+IF_HAVE_PG_REKEY(rekey)
 
 #define show_page_flags(flags)						\
 	(flags) ? __print_flags(flags, "|",				\

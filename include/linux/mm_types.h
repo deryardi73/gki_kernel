@@ -1016,8 +1016,17 @@ struct mm_struct {
 #endif
 		} lru_gen;
 #endif /* CONFIG_LRU_GEN */
-
+#ifdef CONFIG_LRU_CAST
+		/*
+		 * Set when a CPU runs this mm_struct (switching to it, or
+		 * ticking in it), cleared by CAST's walker: unset, no
+		 * young bit can have been set in its page tables since the
+		 * last walk. In KABI padding: no offset shifts.
+		 */
+		ANDROID_KABI_USE(1, unsigned long lru_cast_used);
+#else
 		ANDROID_KABI_RESERVE(1);
+#endif
 		ANDROID_BACKPORT_USE(1, struct task_dma_buf_info *dmabuf_info);
 	} __randomize_layout;
 
@@ -1106,6 +1115,18 @@ static inline void lru_gen_use_mm(struct mm_struct *mm)
 }
 
 #endif /* CONFIG_LRU_GEN */
+
+#ifdef CONFIG_LRU_CAST
+static inline void lru_cast_use_mm(struct mm_struct *mm)
+{
+	if (mm && !READ_ONCE(mm->lru_cast_used))
+		WRITE_ONCE(mm->lru_cast_used, 1);
+}
+#else
+static inline void lru_cast_use_mm(struct mm_struct *mm)
+{
+}
+#endif
 
 struct vma_iterator {
 	struct ma_state mas;

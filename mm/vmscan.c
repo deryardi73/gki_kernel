@@ -28,6 +28,7 @@
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>	/* for buffer_heads_over_limit */
 #include <linux/mm_inline.h>
+#include <linux/kfifo.h>
 #include <linux/backing-dev.h>
 #include <linux/rmap.h>
 #include <linux/topology.h>
@@ -149,6 +150,9 @@ struct scan_control {
 
 	/* The file folios on the current node are dangerously low */
 	unsigned int file_is_tiny:1;
+
+	/* CAST: the node's clean file is at the clean-file floor */
+	unsigned int clean_below_min:1;
 
 	/* Always discard instead of demoting to lower tier memory */
 	unsigned int no_demotion:1;
@@ -667,6 +671,21 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
 
 	nr = zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_FILE) +
 		zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_FILE);
+	/*
+	 * CAST: file under the clean-file floor is not reclaimable, no
+	 * global reclaim takes it; counted in, should_reclaim_retry() would
+	 * keep retrying a node with nothing left it may take. The floor is
+	 * node-wide; each zone is charged its share by the file it holds.
+	 */
+	if (lru_cast_enabled() && nr) {
+		struct pglist_data *pgdat = zone->zone_pgdat;
+		unsigned long node_file = node_page_state(pgdat, NR_ACTIVE_FILE) +
+					  node_page_state(pgdat, NR_INACTIVE_FILE);
+		unsigned long floor = lru_cast_floor_file_pages(pgdat);
+
+		if (floor && node_file)
+			nr -= min(nr, mult_frac(nr, min(floor, node_file), node_file));
+	}
 	if (can_reclaim_anon_pages(NULL, zone_to_nid(zone), NULL))
 		nr += zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_ANON) +
 			zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_ANON);
@@ -1340,6 +1359,8 @@ typedef enum {
 	PAGE_SUCCESS,
 	/* folio is clean and locked */
 	PAGE_CLEAN,
+	/* folio is kcompressd's, to write and reclaim (SWAP_WRITEPAGE_HANDED) */
+	PAGE_HANDED,
 } pageout_t;
 
 /*
@@ -1392,11 +1413,19 @@ static pageout_t pageout(struct folio *folio, struct address_space *mapping,
 			.range_start = 0,
 			.range_end = LLONG_MAX,
 			.for_reclaim = 1,
+			.may_handoff = 1,
 			.swap_plug = plug,
 		};
 
 		folio_set_reclaim(folio);
 		res = mapping->a_ops->writepage(&folio->page, &wbc);
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
+		if (res == SWAP_WRITEPAGE_HANDED) {
+			folio_clear_reclaim(folio);
+			node_stat_add_folio(folio, NR_VMSCAN_WRITE);
+			return PAGE_HANDED;
+		}
+#endif
 		if (res < 0)
 			handle_write_error(mapping, folio, res);
 		if (res == AOP_WRITEPAGE_ACTIVATE) {
@@ -1665,6 +1694,39 @@ static enum folio_references folio_check_references(struct folio *folio,
 			return FOLIOREF_RECLAIM;
 
 		return lru_gen_set_refs(folio, vm_flags) ? FOLIOREF_ACTIVATE : FOLIOREF_KEEP;
+	}
+
+	/*
+	 * CAST: the folio goes if its key still puts it at or below the
+	 * bucket reclaim takes from; above, it goes back to M under its key.
+	 * The key is all there is to ask: a read reaches it by whatever way
+	 * it was seen -- a read(), a fault, the walker's young bits, or a
+	 * young pte found now, a read the folio had not been credited with
+	 * and counted here -- and the folio's place in the ring may be older
+	 * than its last read. Executable file text in use stays whatever its
+	 * key, from the first use seen, as legacy reclaim keeps it: it is
+	 * small, and a program's code evicted is one stalled. Its read is
+	 * counted as the most a word holds (lru_cast_access_kept()), which
+	 * puts it at the top of the ring.
+	 *
+	 * The first young pte after the folio came in may be no more than the
+	 * fault that brought it -- counted already as its entry -- or that and
+	 * more: the bit cannot tell. As legacy does with a folio referenced
+	 * once, it is given another round instead (the mark cleared, it goes
+	 * round its bucket once, behind its equals), and the next young pte is
+	 * counted.
+	 */
+	if (lru_cast_enabled() && lru_cast_folio_on(folio)) {
+		if (referenced_ptes) {
+			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
+				lru_cast_access_kept(folio);
+				return FOLIOREF_ACTIVATE;
+			}
+			if (referenced_folio)
+				return FOLIOREF_ACTIVATE;
+			lru_cast_access_young(folio);
+		}
+		return lru_cast_still_victim(folio) ? FOLIOREF_RECLAIM : FOLIOREF_ACTIVATE;
 	}
 
 	if (referenced_ptes) {
@@ -2185,6 +2247,15 @@ retry:
 				goto keep_locked;
 			case PAGE_ACTIVATE:
 				goto activate_locked;
+			case PAGE_HANDED:
+				/*
+				 * kcompressd writes it and frees it, in a
+				 * moment: counted as freed, or kswapd would
+				 * write more in the meantime
+				 */
+				stat->nr_pageout += nr_pages;
+				nr_reclaimed += nr_pages;
+				continue;
 			case PAGE_SUCCESS:
 				stat->nr_pageout += nr_pages;
 
@@ -2561,6 +2632,53 @@ move:
 	return nr_taken;
 }
 
+#ifdef CONFIG_LRU_CAST
+/*
+ * CAST's victims (mm/lru_cast/reclaim.c): the inactive list is the
+ * newcomers' FIFO window W, the active part M a ring of buckets by key.
+ * CAST picks; the accounting stays here.
+ */
+static unsigned long lru_cast_isolate_folios(unsigned long nr_to_scan,
+		struct lruvec *lruvec, struct list_head *dst,
+		unsigned long *nr_scanned, struct scan_control *sc, int type)
+{
+	enum lru_list lru_w = type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON;
+	enum lru_list lru_m = lru_w + LRU_ACTIVE;
+	struct lru_cast_scan s = {
+		.type = type,
+		.reclaim_idx = sc->reclaim_idx,
+		.may_unmap = sc->may_unmap,
+		.nr_to_scan = nr_to_scan,
+		.nr_w = lruvec_lru_size(lruvec, lru_w, MAX_NR_ZONES),
+		.nr_m = lruvec_lru_size(lruvec, lru_m, MAX_NR_ZONES),
+	};
+	unsigned long skipped = 0;
+	int zid;
+
+	lru_cast_isolate(lruvec, &s, dst);
+
+	for (zid = 0; zid < MAX_NR_ZONES; zid++) {
+		if (!s.skipped[zid])
+			continue;
+		__count_zid_vm_events(PGSCAN_SKIP, zid, s.skipped[zid]);
+		skipped += s.skipped[zid];
+	}
+	*nr_scanned = s.nr_scanned;
+	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, nr_to_scan,
+				    s.nr_scanned, skipped, s.nr_taken, lru_w);
+	update_lru_sizes(lruvec, lru_w, s.taken_w);
+	update_lru_sizes(lruvec, lru_m, s.taken_m);
+	return s.nr_taken;
+}
+#else
+static unsigned long lru_cast_isolate_folios(unsigned long nr_to_scan,
+		struct lruvec *lruvec, struct list_head *dst,
+		unsigned long *nr_scanned, struct scan_control *sc, int type)
+{
+	return 0;
+}
+#endif /* CONFIG_LRU_CAST */
+
 /**
  * folio_isolate_lru() - Try to isolate a folio from its LRU list.
  * @folio: Folio to isolate from its LRU list.
@@ -2763,8 +2881,12 @@ unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 
 	spin_lock_irq(&lruvec->lru_lock);
 
-	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
-				     &nr_scanned, sc, lru);
+	if (lru_cast_on(lruvec))
+		nr_taken = lru_cast_isolate_folios(nr_to_scan, lruvec, &folio_list,
+						    &nr_scanned, sc, file);
+	else
+		nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
+					      &nr_scanned, sc, lru);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 	item = PGSCAN_KSWAPD + reclaimer_offset();
@@ -3006,6 +3128,33 @@ static unsigned int reclaim_folio_list(struct list_head *folio_list,
 	return nr_reclaimed;
 }
 
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
+/*
+ * kcompressd (mm/page_io.c): the folios kswapd handed it, written now,
+ * through the rest of reclaim as kswapd would have taken them -- a folio
+ * read since is kept -- and what is not freed back to the LRU
+ */
+void kcompressd_reclaim(struct list_head *folio_list, struct pglist_data *pgdat)
+{
+	struct reclaim_stat stat;
+	struct folio *folio;
+	struct scan_control sc = {
+		.gfp_mask = GFP_KERNEL,
+		.may_writepage = 1,
+		.may_unmap = 1,
+		.may_swap = 1,
+		.no_demotion = 1,
+	};
+
+	shrink_folio_list(folio_list, pgdat, &sc, &stat, false);
+	while (!list_empty(folio_list)) {
+		folio = lru_to_folio(folio_list);
+		list_del(&folio->lru);
+		folio_putback_lru(folio);
+	}
+}
+#endif
+
 unsigned long __reclaim_pages(struct list_head *folio_list, bool ignore_references,
 			    void *private)
 {
@@ -3051,6 +3200,11 @@ EXPORT_SYMBOL_GPL(reclaim_pages);
 static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 				 struct lruvec *lruvec, struct scan_control *sc)
 {
+	/* CAST: either list's share of the scan picks from both parts */
+	if (lru_cast_on(lruvec))
+		return shrink_inactive_list(nr_to_scan, lruvec, sc,
+					    is_file_lru(lru) ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+
 	if (is_active_lru(lru)) {
 		if (sc->may_deactivate & (1 << is_file_lru(lru)))
 			shrink_active_list(nr_to_scan, lruvec, sc, lru);
@@ -3237,6 +3391,14 @@ static void prepare_scan_count(pg_data_t *pgdat, struct scan_control *sc)
 	}
 
 	customize_sc_file_is_tiny(sc);
+
+	/*
+	 * CAST's clean-file floor holds for all reclaim but that of a
+	 * cgroup at its limit (mm/lru_cast/balance.c).
+	 */
+	sc->clean_below_min = lru_cast_on(target_lruvec) &&
+			      !(cgroup_reclaim(sc) && !sc->proactive) &&
+			      lru_cast_floor_holds(pgdat);
 }
 
 /*
@@ -3259,6 +3421,42 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	unsigned long ap, fp;
 	enum lru_list lru;
 	bool balance_anon_file_reclaim = false;
+
+	/*
+	 * CAST presses both types toward anon's share of memory, the share
+	 * that loses least by the types' measured miss-ratio curves and what
+	 * their refaults cost, with a swappiness of its own, held within
+	 * 1..199 (mm/lru_cast/balance.c). File under the clean-file floor is
+	 * not on offer.
+	 */
+	if (lru_cast_on(lruvec)) {
+		u64 weight[ANON_AND_FILE];
+
+		switch (lru_cast_pick(lruvec, swappiness, sc->priority,
+				       sc->may_swap &&
+				       can_reclaim_anon_pages(memcg, pgdat->node_id, sc),
+				       !sc->clean_below_min, weight)) {
+		case LRU_CAST_ANON:
+			scan_balance = SCAN_ANON;
+			goto out;
+		case LRU_CAST_FILE:
+			scan_balance = SCAN_FILE;
+			goto out;
+		case LRU_CAST_EQUAL:
+			scan_balance = SCAN_EQUAL;
+			goto out;
+		case LRU_CAST_BOTH:
+			fraction[0] = weight[LRU_CAST_ANON];
+			fraction[1] = weight[LRU_CAST_FILE];
+			denominator = MAX_SWAPPINESS;
+			scan_balance = SCAN_FRACT;
+			goto out;
+		default:
+			for_each_evictable_lru(lru)
+				nr[lru] = 0;
+			return;
+		}
+	}
 
 	/* If we have no swap space, do not bother scanning anon folios. */
 	if (!sc->may_swap || !can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
@@ -3419,6 +3617,10 @@ out:
 		if (!scan && !mem_cgroup_online(memcg))
 			scan = min(lruvec_size, SWAP_CLUSTER_MAX);
 
+		/* CAST: no file below the floor, whatever decided it */
+		if (file && sc->clean_below_min)
+			scan = 0;
+
 		switch (scan_balance) {
 		case SCAN_EQUAL:
 			/* Scan lists relative to size */
@@ -3468,7 +3670,8 @@ static bool can_age_anon_pages(struct pglist_data *pgdat,
 
 #ifdef CONFIG_LRU_GEN
 
-#ifdef CONFIG_LRU_GEN_ENABLED
+/* with CAST, CAST comes on at boot: MGLRU only without it (init_lru_gen()) */
+#if defined(CONFIG_LRU_GEN_ENABLED) && !defined(CONFIG_LRU_CAST)
 DEFINE_STATIC_KEY_ARRAY_TRUE(lru_gen_caps, NR_LRU_GEN_CAPS);
 #define get_cap(cap)	static_branch_likely(&lru_gen_caps[cap])
 #else
@@ -6022,12 +6225,15 @@ static bool drain_evictable(struct lruvec *lruvec)
 	return true;
 }
 
-static void lru_gen_change_state(bool enabled)
+static int lru_gen_change_state(bool enabled)
 {
 	static DEFINE_MUTEX(state_mutex);
 
 	struct mem_cgroup *memcg;
+	int err = 0;
 
+	/* CAST, on the same lists, is never on with it (mm/lru_cast/control.c) */
+	lru_cast_switch_begin();
 	cgroup_lock();
 	cpus_read_lock();
 	get_online_mems();
@@ -6035,6 +6241,11 @@ static void lru_gen_change_state(bool enabled)
 
 	if (enabled == lru_gen_enabled())
 		goto unlock;
+
+	if (enabled && lru_cast_is_enabled()) {
+		err = -EBUSY;
+		goto unlock;
+	}
 
 	if (enabled)
 		static_branch_enable_cpuslocked(&lru_gen_caps[LRU_GEN_CORE]);
@@ -6071,6 +6282,8 @@ unlock:
 	put_online_mems();
 	cpus_read_unlock();
 	cgroup_unlock();
+	lru_cast_switch_end();
+	return err;
 }
 
 /******************************************************************************
@@ -6131,9 +6344,12 @@ static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
 	for (i = 0; i < NR_LRU_GEN_CAPS; i++) {
 		bool enabled = caps & BIT(i);
 
-		if (i == LRU_GEN_CORE)
-			lru_gen_change_state(enabled);
-		else if (enabled)
+		if (i == LRU_GEN_CORE) {
+			int err = lru_gen_change_state(enabled);
+
+			if (err)
+				return err;
+		} else if (enabled)
 			static_branch_enable(&lru_gen_caps[i]);
 		else
 			static_branch_disable(&lru_gen_caps[i]);
@@ -6589,6 +6805,16 @@ static int __init init_lru_gen(void)
 	debugfs_create_file("lru_gen", 0644, NULL, NULL, &lru_gen_rw_fops);
 	debugfs_create_file("lru_gen_full", 0444, NULL, NULL, &lru_gen_ro_fops);
 
+	/* CAST off (lru_cast=0): MGLRU comes on if it would have without CAST */
+	if (IS_ENABLED(CONFIG_LRU_GEN_ENABLED) && IS_ENABLED(CONFIG_LRU_CAST) &&
+	    !lru_gen_change_state(true)) {
+		int i;
+
+		for (i = 0; i < NR_LRU_GEN_CAPS; i++)
+			if (i != LRU_GEN_CORE)
+				static_branch_enable(&lru_gen_caps[i]);
+	}
+
 	return 0;
 };
 late_initcall(init_lru_gen);
@@ -6657,8 +6883,14 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	if (nr_reclaimed >= nr_to_reclaim)
 		goto out;
 
+	/*
+	 * Active anon is aged after the loop, not reclaimed in it -- but for
+	 * CAST, which takes from M, the active part, as it is: with W
+	 * empty, as it is when W's share is 0, anon would be left unscanned.
+	 */
 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
-					nr[LRU_INACTIVE_FILE]) {
+	       nr[LRU_INACTIVE_FILE] ||
+	       (lru_cast_on(lruvec) && nr[LRU_ACTIVE_ANON])) {
 		unsigned long nr_anon, nr_file, percentage;
 		unsigned long nr_scanned;
 
@@ -6736,9 +6968,10 @@ out:
 
 	/*
 	 * Even if we did not try to evict anon pages at all, we want to
-	 * rebalance the anon lru active/inactive ratio.
+	 * rebalance the anon lru active/inactive ratio. CAST has no
+	 * active list to age.
 	 */
-	if (can_age_anon_pages(lruvec_pgdat(lruvec), sc) &&
+	if (!lru_cast_on(lruvec) && can_age_anon_pages(lruvec_pgdat(lruvec), sc) &&
 	    inactive_is_low(lruvec, LRU_INACTIVE_ANON))
 		shrink_active_list(SWAP_CLUSTER_MAX, lruvec,
 				   sc, LRU_ACTIVE_ANON);
@@ -7591,6 +7824,10 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 		return;
 	}
 
+	/* CAST has no active list to age: its order is the key */
+	if (lru_cast_enabled())
+		return;
+
 	if (!can_age_anon_pages(pgdat, sc))
 		return;
 
@@ -8332,6 +8569,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 void __meminit kswapd_run(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
+	int ret;
+#endif
 
 	pgdat_kswapd_lock(pgdat);
 	if (!pgdat->kswapd) {
@@ -8342,7 +8582,42 @@ void __meminit kswapd_run(int nid)
 			pr_err("Failed to start kswapd on node %d\n", nid);
 			pgdat->kswapd = NULL;
 		}
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
+		pgdat->kcompressd_fifo = kmalloc_node(sizeof(struct kfifo),
+						      GFP_KERNEL, nid);
+		if (!pgdat->kcompressd_fifo) {
+			pr_err("%s: fail to alloc kcompressd fifo\n", __func__);
+			goto out;
+		}
+		ret = kfifo_alloc(pgdat->kcompressd_fifo,
+				KCOMPRESSD_FIFO_SIZE * sizeof(struct folio *),
+				GFP_KERNEL);
+		if (ret) {
+			pr_err("%s: fail to kfifo_alloc\n", __func__);
+			kfree(pgdat->kcompressd_fifo);
+			pgdat->kcompressd_fifo = NULL;
+			goto out;
+		}
+
+		pr_info("kcompressd (forked from kcompressd-unofficial by Masahito Suzuki, originally Kcompressd by Qun-Wei Lin from MediaTek)\n");
+		spin_lock_init(&pgdat->kcompressd_fifo_lock);
+		pgdat->kcompressd = kthread_create_on_node(kcompressd, pgdat, nid,
+				"kcompressd%d", nid);
+		if (IS_ERR(pgdat->kcompressd)) {
+			pr_err("Failed to start kcompressd on node %d, ret=%ld\n",
+					nid, PTR_ERR(pgdat->kcompressd));
+			pgdat->kcompressd = NULL;
+			kfifo_free(pgdat->kcompressd_fifo);
+			kfree(pgdat->kcompressd_fifo);
+			pgdat->kcompressd_fifo = NULL;
+		} else {
+			wake_up_process(pgdat->kcompressd);
+		}
+#endif
 	}
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
+out:
+#endif
 	pgdat_kswapd_unlock(pgdat);
 }
 
@@ -8361,6 +8636,15 @@ void __meminit kswapd_stop(int nid)
 		kthread_stop(kswapd);
 		pgdat->kswapd = NULL;
 	}
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
+	if (pgdat->kcompressd) {
+		kthread_stop(pgdat->kcompressd);
+		pgdat->kcompressd = NULL;
+		kfifo_free(pgdat->kcompressd_fifo);
+		kfree(pgdat->kcompressd_fifo);
+		pgdat->kcompressd_fifo = NULL;
+	}
+#endif
 	pgdat_kswapd_unlock(pgdat);
 }
 

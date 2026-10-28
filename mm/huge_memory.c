@@ -17,6 +17,7 @@
 #include <linux/swap.h>
 #include <linux/shrinker.h>
 #include <linux/mm_inline.h>
+#include <linux/lru_cast.h>
 #include <linux/swapops.h>
 #include <linux/backing-dev.h>
 #include <linux/dax.h>
@@ -3217,6 +3218,8 @@ static void __split_huge_page_tail(struct folio *folio, int tail,
 	}
 	if (folio_test_swapcache(folio))
 		new_folio->swap.val = folio->swap.val + tail;
+	/* the new folio's reads are the old one's */
+	lru_cast_copy(new_folio, folio);
 
 	/* Page flags must be visible before we make the page non-compound. */
 	smp_wmb();

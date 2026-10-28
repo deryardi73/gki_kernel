@@ -8,6 +8,7 @@
 #include <linux/string.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/swapops.h>
+#include <linux/lru_cast.h>
 
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/mm.h>
@@ -104,7 +105,8 @@ static __always_inline enum lru_list folio_lru_list(struct folio *folio)
 
 #ifdef CONFIG_LRU_GEN
 
-#ifdef CONFIG_LRU_GEN_ENABLED
+/* as mm/vmscan.c's lru_gen_caps */
+#if defined(CONFIG_LRU_GEN_ENABLED) && !defined(CONFIG_LRU_CAST)
 static inline bool lru_gen_enabled(void)
 {
 	DECLARE_STATIC_KEY_TRUE(lru_gen_caps[NR_LRU_GEN_CAPS]);
@@ -373,6 +375,8 @@ void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)
 
 	if (lru_gen_add_folio(lruvec, folio, false))
 		return;
+	if (lru_cast_add_folio(lruvec, folio, false))
+		return;
 
 	trace_android_vh_add_page_to_lrulist(folio, false, lru);
 	update_lru_size(lruvec, lru, folio_zonenum(folio),
@@ -392,6 +396,8 @@ void lruvec_add_folio_tail(struct lruvec *lruvec, struct folio *folio)
 		return;
 
 	if (lru_gen_add_folio(lruvec, folio, true))
+		return;
+	if (lru_cast_add_folio(lruvec, folio, true))
 		return;
 
 	trace_android_vh_add_page_to_lrulist(folio, false, lru);

@@ -1528,8 +1528,22 @@ struct task_struct {
 	ANDROID_KABI_RESERVE(4);
 	ANDROID_KABI_RESERVE(5);
 	ANDROID_KABI_RESERVE(6);
+#ifdef CONFIG_LRU_CAST
+	/*
+	 * CAST: the wait for a page to come in the task is in
+	 * (mm/lru_cast/tune/cost.c). Kept in KABI padding: a field inserted
+	 * mid-struct shifts every later offset, and prebuilt vendor modules
+	 * (blocktag...) read task_struct at their compiled offsets.
+	 */
+	ANDROID_KABI_USE(7, struct {
+		u8	lru_cast_wait;
+		u16	lru_cast_wait_where;	/* its CPU, or its device's place */
+	});
+	ANDROID_KABI_USE(8, unsigned long lru_cast_wait_swap);	/* swap entry a fault waits for */
+#else
 	ANDROID_KABI_RESERVE(7);
 	ANDROID_KABI_RESERVE(8);
+#endif
 
 #ifdef CONFIG_RV
 	/*

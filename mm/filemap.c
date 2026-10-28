@@ -21,6 +21,7 @@
 #include <linux/gfp.h>
 #include <linux/mm.h>
 #include <linux/swap.h>
+#include <linux/lru_cast.h>
 #include <linux/swapops.h>
 #include <linux/syscalls.h>
 #include <linux/mman.h>
@@ -2519,7 +2520,7 @@ static bool filemap_range_uptodate(struct address_space *mapping,
 	return mapping->a_ops->is_partially_uptodate(folio, pos, count);
 }
 
-static int filemap_update_page(struct kiocb *iocb,
+static int __filemap_update_page(struct kiocb *iocb,
 		struct address_space *mapping, size_t count,
 		struct folio *folio, bool need_uptodate)
 {
@@ -2574,6 +2575,24 @@ unlock_mapping:
 	filemap_invalidate_unlock_shared(mapping);
 	if (error == AOP_TRUNCATED_PAGE)
 		folio_put(folio);
+	return error;
+}
+
+/* CAST: what waiting for a page to come back in cost the task */
+static int filemap_update_page(struct kiocb *iocb,
+		struct address_space *mapping, size_t count,
+		struct folio *folio, bool need_uptodate)
+{
+	/* a wait for a page not yet read; its refault asked before, the folio may go */
+	bool waits = !folio_test_uptodate(folio);
+	int error;
+
+	if (waits)
+		lru_cast_wait_begin_file(lru_cast_refaulted(folio), mapping);
+	error = __filemap_update_page(iocb, mapping, count, folio, need_uptodate);
+	/* not a wait: to be tried again, or waited for by no task */
+	if (waits)
+		lru_cast_wait_end(error != -EAGAIN && error != -EIOCBQUEUED);
 	return error;
 }
 
@@ -3405,6 +3424,8 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 	struct folio *folio;
 	vm_fault_t ret = 0;
 	bool mapping_locked = false;
+	/* CAST: a wait for the page to come in, if it is not yet */
+	bool waits = false;
 
 	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	if (unlikely(index >= max_idx))
@@ -3424,12 +3445,16 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 		if (unlikely(!folio_test_uptodate(folio))) {
 			filemap_invalidate_lock_shared(mapping);
 			mapping_locked = true;
+			waits = true;
+			lru_cast_wait_begin_file(lru_cast_refaulted(folio), mapping);
 		}
 	} else {
 		/* No page in the page cache at all */
 		count_vm_event(PGMAJFAULT);
 		count_memcg_event_mm(vmf->vma->vm_mm, PGMAJFAULT);
 		ret = VM_FAULT_MAJOR;
+		waits = true;
+		lru_cast_wait_begin_file(false, mapping);	/* its refault told once in */
 		fpin = do_sync_mmap_readahead(vmf);
 retry_find:
 		/*
@@ -3508,6 +3533,8 @@ retry_find:
 		return VM_FAULT_SIGBUS;
 	}
 
+	if (waits)	/* ended by __do_fault() */
+		lru_cast_wait_refault(lru_cast_refaulted(folio));
 	vmf->page = folio_file_page(folio, index);
 	trace_android_vh_filemap_fault_folio_locked(inode, folio, index);
 	return ret | VM_FAULT_LOCKED;
@@ -3539,8 +3566,11 @@ out_retry:
 	 * re-find the vma and come back and find our hopefully still populated
 	 * page.
 	 */
-	if (!IS_ERR(folio))
+	if (!IS_ERR(folio)) {
+		if (waits)	/* ended by __do_fault() */
+			lru_cast_wait_refault(lru_cast_refaulted(folio));
 		folio_put(folio);
+	}
 	if (mapping_locked)
 		filemap_invalidate_unlock_shared(mapping);
 	if (fpin)

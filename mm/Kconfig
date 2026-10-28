@@ -1313,6 +1313,23 @@ config PTE_MARKER_UFFD_WP
 	  file-backed memory types like shmem and hugetlbfs.
 
 # multi-gen LRU {
+config LRU_CAST
+	bool "CAST page replacement"
+	depends on 64BIT && MMU && SPARSEMEM
+	default y
+	help
+	  A replacement for the active/inactive LRU lists: newcomers wait in
+	  a FIFO window, the rest are ranked by their exponentially decayed
+	  read count, kept in buckets of a key that does not change while a
+	  folio is not read (CAST). It keeps a 32-bit word per page
+	  frame, 1/1024 of memory, set up when it first runs.
+
+	  It may be built with the multi-gen LRU; the two are never on at
+	  once. CAST is on at boot unless lru_cast=0 is given, and then the
+	  multi-gen LRU is as LRU_GEN_ENABLED says. At run time, one is
+	  switched off before the other is switched on:
+	  /sys/kernel/mm/lru_cast/enabled, /sys/kernel/mm/lru_gen/enabled.
+
 config LRU_GEN
 	bool "Multi-Gen LRU"
 	depends on MMU
@@ -1326,7 +1343,8 @@ config LRU_GEN_ENABLED
 	bool "Enable by default"
 	depends on LRU_GEN
 	help
-	  This option enables the multi-gen LRU by default.
+	  This option enables the multi-gen LRU by default. With LRU_CAST,
+	  only when booted with lru_cast=0.
 
 config LRU_GEN_STATS
 	bool "Full stats for debugging"

@@ -14,6 +14,7 @@
  */
 
 #include <linux/migrate.h>
+#include <linux/lru_cast.h>
 #include <linux/export.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
@@ -599,6 +600,8 @@ int migrate_huge_page_move_mapping(struct address_space *mapping,
 void folio_migrate_flags(struct folio *newfolio, struct folio *folio)
 {
 	int cpupid;
+
+	lru_cast_migrate(newfolio, folio);
 
 	if (folio_test_error(folio))
 		folio_set_error(newfolio);

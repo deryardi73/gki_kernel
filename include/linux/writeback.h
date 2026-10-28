@@ -70,6 +70,12 @@ struct writeback_control {
 	 */
 	unsigned no_cgroup_owner:1;
 
+	/*
+	 * pageout(): swap_writepage() may queue the folio to kcompressd with
+	 * the rest of its reclaim (SWAP_WRITEPAGE_HANDED)
+	 */
+	unsigned may_handoff:1;
+
 	/* To enable batching of swap writes to non-block-device backends,
 	 * "plug" can be set point to a 'struct swap_iocb *'.  When all swap
 	 * writes have been submitted, if with swap_iocb is not NULL,

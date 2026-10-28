@@ -143,6 +143,9 @@ enum pageflags {
 	PG_oem_reserved_4,
 	PG_oem_reserved_5,
 #endif
+#ifdef CONFIG_LRU_CAST
+	PG_rekey,		/* CAST: read since its key was taken */
+#endif
 	__NR_PAGEFLAGS,
 
 	PG_readahead = PG_reclaim,
@@ -605,6 +608,10 @@ SETPAGEFLAG(SwapCache, swapcache, PF_NO_TAIL)
 CLEARPAGEFLAG(SwapCache, swapcache, PF_NO_TAIL)
 #else
 PAGEFLAG_FALSE(SwapCache, swapcache)
+#endif
+
+#ifdef CONFIG_LRU_CAST
+FOLIO_FLAG(rekey, FOLIO_HEAD_PAGE)
 #endif
 
 PAGEFLAG(Unevictable, unevictable, PF_HEAD)

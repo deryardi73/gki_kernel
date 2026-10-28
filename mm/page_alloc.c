@@ -49,6 +49,7 @@
 #include <linux/page_owner.h>
 #include <linux/page_pinner.h>
 #include <linux/page_table_check.h>
+#include <linux/lru_cast.h>
 #include <linux/memcontrol.h>
 #include <linux/ftrace.h>
 #include <linux/lockdep.h>
@@ -1294,6 +1295,7 @@ static __always_inline bool free_pages_prepare(struct page *page,
 	reset_page_owner(page, order);
 	free_page_pinner(page, order);
 	page_table_check_free(page, order);
+	lru_cast_reset(page, order);
 
 	if (!PageHighMem(page)) {
 		debug_check_no_locks_freed(page_address(page),

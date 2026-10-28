@@ -23,7 +23,10 @@
 #include <linux/page-flags.h>
 #include <linux/local_lock.h>
 #include <linux/android_kabi.h>
+#include <linux/sizes.h>
 #include <asm/page.h>
+
+struct kfifo;
 
 /* Free memory management - zoned buddy allocator.  */
 #ifndef CONFIG_ARCH_FORCE_MAX_ORDER
@@ -646,6 +649,73 @@ static inline void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
 
 #endif /* CONFIG_LRU_GEN */
 
+#ifdef CONFIG_LRU_CAST
+/*
+ * CAST: the active part of an lruvec (M) is the active list, in no
+ * order; reclaim finds its lowest by sweeping the node's state words and
+ * keeping a few candidates, see mm/lru_cast/policy/ring.c. The inactive
+ * list is the newcomers' FIFO window (W).
+ */
+#define LRU_CAST_BUCKETS	256	/* the controllers' simulated caches' ring */
+#define LRU_CAST_CANDS		128
+#define LRU_CAST_SAMPLES	128
+#define LRU_CAST_BLOCKS	256
+#define LRU_CAST_LIDS		512	/* an lruvec's number in its node's owner tags */
+
+struct lru_cast_cand {
+	unsigned long		pfn;
+	long			key;
+	u32			word;
+};
+
+struct lru_cast {
+	/* the lowest keys of the last sweep, ascending; the next to take */
+	struct lru_cast_cand	cand[LRU_CAST_CANDS];
+	unsigned int		ncand, pos;
+	/* the PFN the sweep reads next; keys read this pass, a sample of them */
+	unsigned long		cursor, seen;
+	long			sample[LRU_CAST_SAMPLES];
+	/* a candidate is at or below this, a quantile of the last pass's keys */
+	long			tau;
+	bool			tau_ok;
+	u32			rnd;
+	/* ([0] only) CAST's number for the lruvec; its number in its node, 0 until given */
+	u16			tag;
+	u16			lid;
+	/* the node in LRU_CAST_BLOCKS blocks of 2^block_shift PFNs: those M may have folios in */
+	u8			block_shift;
+	DECLARE_BITMAP(blocks, LRU_CAST_BLOCKS);
+	/* the decay level the keys were computed under */
+	int			ring_le;
+	/* the bucket reclaim last took from: a folio found young is kept only above it */
+	long			victim;
+	/* pages that may come into W before its size is looked at again */
+	long			w_room;
+};
+
+/*
+ * per node: the eviction clock and its tick, one for both types so that
+ * the value of an anon page and of a file page are in the same time
+ */
+struct lru_cast_clock {
+	/*
+	 * C/4 pages taken in per tick, C what the node's LRUs can hold: read
+	 * with every read recorded, written once a tick, on a line of its own
+	 */
+	unsigned long		tick ____cacheline_aligned_in_smp;
+	/* pages taken in so far, added to once a CPU's batch */
+	atomic_long_t		installed ____cacheline_aligned_in_smp;
+	/* pages taken in at which the tick next advances */
+	unsigned long		next;
+	/* pages evicted so far, written with every eviction */
+	unsigned long		evict;
+	/* the lruvecs' numbers in the node's owner tags (lru_cast.lid) in use */
+	DECLARE_BITMAP(lids, LRU_CAST_LIDS);
+	/* ... of those, the numbers of lruvecs whose folios went to another's lists */
+	DECLARE_BITMAP(lids_moved, LRU_CAST_LIDS);
+};
+#endif
+
 struct lruvec {
 	struct list_head		lists[NR_LRU_LISTS];
 	/* per lruvec lru_lock for memcg */
@@ -668,6 +738,11 @@ struct lruvec {
 	struct lru_gen_folio		lrugen;
 	/* to concurrently iterate lru_gen_mm_list */
 	struct lru_gen_mm_state		mm_state;
+#endif
+#ifdef CONFIG_LRU_CAST
+	struct lru_cast		lru_cast[ANON_AND_FILE];
+	/* CAST runs this lruvec: its active folios are in the rings */
+	bool				lru_cast_on;
 #endif
 #ifdef CONFIG_MEMCG
 	struct pglist_data *pgdat;
@@ -1370,6 +1445,20 @@ typedef struct pglist_data {
 
 	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
 
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
+/*
+ * kfifo backing storage capacity (in folio* slots). The sysfs knob
+ * vm_kcompressd sets the effective queue length in [-100, +100]; this
+ * matches the upper bound. ~800 bytes per pgdat regardless of the
+ * currently configured depth.
+ */
+#define KCOMPRESSD_FIFO_SIZE 100
+	wait_queue_head_t kcompressd_wait;
+	struct task_struct *kcompressd;
+	struct kfifo *kcompressd_fifo;	/* kfifo.h pulls in mm.h: kept out of here */
+	spinlock_t kcompressd_fifo_lock;
+#endif
+
 	ANDROID_OEM_DATA(1);
 #ifdef CONFIG_COMPACTION
 	int kcompactd_max_order;
@@ -1438,6 +1527,9 @@ typedef struct pglist_data {
 	struct lru_gen_mm_walk mm_walk;
 	/* lru_gen_folio list */
 	struct lru_gen_memcg memcg_lru;
+#endif
+#ifdef CONFIG_LRU_CAST
+	struct lru_cast_clock lru_cast_clock;
 #endif
 
 	CACHELINE_PADDING(_pad2_);
