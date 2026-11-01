@@ -56,10 +56,10 @@
  * Everything here runs under the lruvec's lru_lock but the work.
  */
 #include <linux/hash.h>
-#include <linux/sort.h>
 #include <linux/xarray.h>
 #include <linux/workqueue.h>
 #include "policy/policy.h"
+#include "core/inl.h"
 
 #define LRU_CAST_RES		4	/* sixteenths of a half-life */
 #define LRU_CAST_SWEEP_MAX		4096	/* frames a sweep reads at most */
@@ -405,18 +405,56 @@ void lru_cast_ring_admit(struct lruvec *lruvec, struct folio *folio, int type)
 	sw_add(SW_GATE, 1);
 }
 
-static int lru_cast_cmp_cand(const void *a, const void *b)
+/*
+ * The candidates, a max-heap on the key, in ascending key order: the sort-down
+ * of a heapsort. The heap is already built, and sort() would call a compare
+ * function for each of the n log n steps.
+ */
+static void lru_cast_cand_sort(struct lru_cast_cand *a, unsigned int n)
 {
-	long x = ((const struct lru_cast_cand *)a)->key, y = ((const struct lru_cast_cand *)b)->key;
+	unsigned int e;
 
-	return x < y ? -1 : x > y;
+	for (e = n; e-- > 1;) {
+		struct lru_cast_cand x = a[e];
+		unsigned int i = 0;
+
+		a[e] = a[0];
+		for (;;) {
+			unsigned int l = 2 * i + 1, m = l;
+
+			if (l >= e)
+				break;
+			if (l + 1 < e && a[l + 1].key > a[l].key)
+				m = l + 1;
+			if (a[m].key <= x.key)
+				break;
+			a[i] = a[m];
+			i = m;
+		}
+		a[i] = x;
+	}
 }
 
-static int lru_cast_cmp_long(const void *a, const void *b)
+/*
+ * The @k-th smallest of the @n keys in @a (k < n), as sort() would put it at
+ * a[k]; @a is left as it is. Only the k + 1 smallest are kept, in order.
+ */
+static long lru_cast_kth(const long *a, unsigned int n, unsigned int k)
 {
-	long x = *(const long *)a, y = *(const long *)b;
+	long t[((LRU_CAST_SAMPLES - 1) >> LRU_CAST_TAU_SHIFT) + 1];
+	unsigned int i, j, m = 0;
 
-	return x < y ? -1 : x > y;
+	for (i = 0; i < n; i++) {
+		long v = a[i];
+
+		if (m > k && v >= t[k])
+			continue;
+		j = m < k + 1 ? m++ : k;
+		for (; j && t[j - 1] > v; j--)
+			t[j] = t[j - 1];
+		t[j] = v;
+	}
+	return t[k];
 }
 
 /* the candidates as a max-heap on the key: one more in, the highest out if full */
@@ -506,8 +544,7 @@ static void lru_cast_tau_probe(struct lruvec *lruvec, int type, unsigned int shi
 	k->seen = 0;
 	if (n < LRU_CAST_PROBE_MIN)
 		return;
-	sort(k->sample, n, sizeof(long), lru_cast_cmp_long, NULL);
-	k->tau = k->sample[(n - 1) >> LRU_CAST_TAU_SHIFT];
+	k->tau = lru_cast_kth(k->sample, n, (n - 1) >> LRU_CAST_TAU_SHIFT);
 	k->tau_ok = true;
 	sw_add(SW_PROBED, 1);
 }
@@ -547,8 +584,7 @@ static void lru_cast_sweep(struct lruvec *lruvec, int type)
 			if (k->seen) {
 				unsigned int m = min_t(unsigned long, k->seen, LRU_CAST_SAMPLES);
 
-				sort(k->sample, m, sizeof(long), lru_cast_cmp_long, NULL);
-				k->tau = k->sample[(m - 1) >> LRU_CAST_TAU_SHIFT];
+				k->tau = lru_cast_kth(k->sample, m, (m - 1) >> LRU_CAST_TAU_SHIFT);
 				k->tau_ok = true;
 				k->seen = 0;
 			}
@@ -566,7 +602,7 @@ static void lru_cast_sweep(struct lruvec *lruvec, int type)
 			if (k->cursor == bstart)
 				clean = b;
 			lim = min(bend, k->cursor + budget - frames);
-			pfn = lru_cast_find_owner(k->cursor, lim, owner, &w);
+			pfn = lru_cast_find_owner_inl(k->cursor, lim, owner, &w);
 			frames += pfn - k->cursor;
 			k->cursor = pfn;
 			if (pfn >= lim) {
@@ -586,7 +622,7 @@ static void lru_cast_sweep(struct lruvec *lruvec, int type)
 		if (!(w >> 24))
 			continue;
 		words++;
-		key = lru_cast_rank(lru_cast_key_res(w, tick, le, LRU_CAST_RES), pfn, w);
+		key = lru_cast_rank(lru_cast_key_res_inl(w, tick, le, LRU_CAST_RES), pfn, w);
 		/* a reservoir sample of the pass's keys */
 		if (k->seen < LRU_CAST_SAMPLES) {
 			k->sample[k->seen] = key;
@@ -599,7 +635,7 @@ static void lru_cast_sweep(struct lruvec *lruvec, int type)
 		k->seen++;
 		lru_cast_heap_put(k, pfn, key, w);
 	}
-	sort(k->cand, k->ncand, sizeof(k->cand[0]), lru_cast_cmp_cand, NULL);
+	lru_cast_cand_sort(k->cand, k->ncand);
 	sw_add(SW_SWEEPS, 1);
 	sw_add(SW_FRAMES, frames);
 	sw_add(SW_WORDS, words);

@@ -709,10 +709,17 @@ struct lru_cast_clock {
 	unsigned long		next;
 	/* pages evicted so far, written with every eviction */
 	unsigned long		evict;
+	/*
+	 * by type, pages evicted with a shadow and, of those, pages faulted
+	 * back within the ghosts' window: aged by 1/4 a tick
+	 */
+	unsigned long		shadowed[ANON_AND_FILE], returned[ANON_AND_FILE];
 	/* the lruvecs' numbers in the node's owner tags (lru_cast.lid) in use */
 	DECLARE_BITMAP(lids, LRU_CAST_LIDS);
 	/* ... of those, the numbers of lruvecs whose folios went to another's lists */
 	DECLARE_BITMAP(lids_moved, LRU_CAST_LIDS);
+	/* the PFN the marking of stale words reads next, and the tick it has read up to */
+	unsigned long		stale_pfn, stale_tick;
 };
 #endif
 

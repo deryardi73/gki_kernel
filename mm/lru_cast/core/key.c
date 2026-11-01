@@ -28,6 +28,7 @@
  * Pure arithmetic on a state word and a clock.
  */
 #include "core/core.h"
+#include "core/inl.h"
 
 /* 2^(-f/256), Q16 */
 static const u32 lru_cast_exp2n[256] = {
@@ -66,7 +67,7 @@ static const u32 lru_cast_exp2n[256] = {
 };
 
 /* 256 * log2(1 + m/256) */
-static const u8 lru_cast_log2m[256] = {
+const u8 lru_cast_log2m[256] = {
 	0, 1, 3, 4, 6, 7, 9, 10, 11, 13, 14, 16,
 	17, 18, 20, 21, 22, 24, 25, 26, 28, 29, 30, 32,
 	33, 34, 36, 37, 38, 40, 41, 42, 44, 45, 46, 47,
@@ -91,12 +92,6 @@ static const u8 lru_cast_log2m[256] = {
 	253, 254, 255, 255,
 };
 
-/* tau / H in Q16 half-lives per tick: 2^(le - 10) */
-static inline u64 lru_cast_dq(int le)
-{
-	return le ? 1ULL << (le + 6) : 0;
-}
-
 /* 2^-(age tau / H), Q16, the age in half ticks */
 static u64 lru_cast_weight(u32 age2, int le)
 {
@@ -117,46 +112,35 @@ static u32 lru_cast_gap2(u32 c)
 	return c ? 3 * (1U << c) - 1 : 1;
 }
 
-/* 256 log2(v / 2^16) */
-static s64 lru_cast_log2q8(u64 v)
-{
-	int msb = fls64(v) - 1;
-	u32 m = (msb >= 8 ? v >> (msb - 8) : v << (8 - msb)) & 255;
+/*
+ * The weights of a word's reads at each decay, its gap codes read as an
+ * index: [0] the newest's, 1, [1 + g1] the one before's, [9 + 8 g1 + g2]
+ * the one before that's (lru_cast_key_res()). Set up once, at boot.
+ */
+u32 lru_cast_wtab[LRU_CAST_LE_MAX + 1][LRU_CAST_WTAB] __read_mostly;
 
-	return ((s64)msb - 16) * 256 + lru_cast_log2m[m];
+void __init lru_cast_key_init(void)
+{
+	u32 g1, g2;
+	int le;
+
+	for (le = 1; le <= LRU_CAST_LE_MAX; le++) {
+		u32 *t = lru_cast_wtab[le];
+
+		t[0] = lru_cast_weight(0, le);
+		for (g1 = 0; g1 < 8; g1++) {
+			t[1 + g1] = lru_cast_weight(lru_cast_gap2(g1), le);
+			for (g2 = 0; g2 < 8; g2++)
+				t[9 + 8 * g1 + g2] =
+					lru_cast_weight(lru_cast_gap2(g1) + lru_cast_gap2(g2), le);
+		}
+	}
 }
 
 /* the bucket of a state word: 2^-@res half-lives of the key, or n */
 long lru_cast_key_res(u32 w, unsigned long tick, int le, int res)
 {
-	u32 n = w >> 24, m = min(n, 3u), j, rel = 0;
-	u8 age0 = tick - (w & 0xff);
-	unsigned long last = tick >= age0 ? tick - age0 : 0;
-	u64 s = 0, wt = 0;
-
-	if (!le)
-		return n;
-	if (!n)
-		return LONG_MIN;
-	/*
-	 * The key is the same taken at any time; taken at the last read, its
-	 * weight is 1 and the sum cannot underflow however long ago that was.
-	 */
-	for (j = 0; j < m; j++) {
-		if (j)		/* the middle of the gap its code allows, in half ticks */
-			rel += lru_cast_gap2((w >> (LRU_CAST_W_GAP + 3 * (j - 1))) & 7);
-		wt = lru_cast_weight(rel, le);
-		s += wt;
-	}
-	if (n > 3)
-		s += (u64)(n - 3) * wt;		/* older reads count at the oldest stamp */
-	return ((s64)((last * lru_cast_dq(le)) >> 8) + lru_cast_log2q8(s)) >> (8 - res);
-}
-
-/* quarter half-lives */
-long lru_cast_key(u32 w, unsigned long tick, int le)
-{
-	return lru_cast_key_res(w, tick, le, 2);
+	return lru_cast_key_res_inl(w, tick, le, res);
 }
 
 long lru_cast_window_lo(unsigned long tick, int le)

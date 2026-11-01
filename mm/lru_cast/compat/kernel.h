@@ -20,6 +20,16 @@
 #if LRU_CAST_CAP_SWAPPINESS_IN_SWAP_H
 #include "../../swap.h"
 #endif
+#if LRU_CAST_CAP_SWAP_TB_FLAGS
+#include "../../swap_table.h"
+#endif
+
+/* the top bits of an anon shadow's xarray value, the swap table's own */
+#if LRU_CAST_CAP_SWAP_TB_FLAGS
+#define LRU_CAST_SHADOW_ANON_RESERVED	SWAP_COUNT_SHIFT
+#else
+#define LRU_CAST_SHADOW_ANON_RESERVED	0
+#endif
 
 #if LRU_CAST_CAP_NO_PMD_FOLIO
 #ifndef pmd_folio
@@ -155,6 +165,26 @@ static inline bool lru_cast_queue_work(struct work_struct *work)
 	return queue_work(system_dfl_wq, work);
 #else
 	return queue_work(system_unbound_wq, work);
+#endif
+}
+
+/* @dwork run on the unbound system workqueue in @delay jiffies, or sooner if it was to */
+static inline bool lru_cast_queue_delayed_work(struct delayed_work *dwork, unsigned long delay)
+{
+#if LRU_CAST_CAP_SYSTEM_DFL_WQ
+	return queue_delayed_work(system_dfl_wq, dwork, delay);
+#else
+	return queue_delayed_work(system_unbound_wq, dwork, delay);
+#endif
+}
+
+/* ... in @delay jiffies, whenever it was to */
+static inline bool lru_cast_mod_delayed_work(struct delayed_work *dwork, unsigned long delay)
+{
+#if LRU_CAST_CAP_SYSTEM_DFL_WQ
+	return mod_delayed_work(system_dfl_wq, dwork, delay);
+#else
+	return mod_delayed_work(system_unbound_wq, dwork, delay);
 #endif
 }
 

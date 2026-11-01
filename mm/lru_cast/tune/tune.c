@@ -26,11 +26,14 @@
  * pages' state words with the main cache, and its clock -- the nodes'
  * ticks, so that le means the same half-life here as there.
  *
- * All under one lock, taken only for sampled pages: a world holds of each
- * type what the other leaves. With the controllers off
+ * A read is not taken in where it happens: it is queued on its CPU and a
+ * worker takes the queues in, every few milliseconds or sooner, all under
+ * one lock -- a world holds of each type what the other leaves -- that no
+ * reader waits for. With the controllers off
  * (lru_cast_tune_set_auto()) nothing is sampled: the numbers are set by hand.
  */
 #include <linux/sysfs.h>
+#include <linux/percpu.h>
 #include "tune/tune.h"
 #include "tune/sim.h"
 #include "tune/world.h"
@@ -54,8 +57,11 @@ struct lru_cast_tune_type {
 };
 
 static struct lru_cast_tune_type *lru_cast_tune_types[ANON_AND_FILE];
-static DEFINE_SPINLOCK(lru_cast_tune_lock);
+static DEFINE_MUTEX(lru_cast_tune_lock);
 static unsigned int lru_cast_tune_nslots;		/* slots per type */
+/* the curve's evidence: the tick it was last aged at, and the accesses it holds, in 1/256 */
+static unsigned long lru_cast_tune_aged;
+static long lru_cast_tune_held;
 
 unsigned int lru_cast_tune_on __read_mostly = 1;
 
@@ -109,32 +115,77 @@ static void lru_cast_tune_evaluate(struct lru_cast_tune_type *t)
 
 /* ---------------------------------------------------------------- reads */
 
-/* a read of @folio, whose block @block is in the sample (lru_cast_tune_read()) */
-void lru_cast_tune_event(struct folio *folio, u64 block)
+/*
+ * A read of a sampled page, as the caches take it: queued where it
+ * happened, taken in order of each CPU's queue, a queue at a time.
+ */
+struct lru_cast_tune_rec {
+	u64 id, block;
+	pgoff_t index;
+	unsigned long tick;		/* the nodes' clock when it was read */
+	unsigned int nr;
+	int type;
+};
+
+/*
+ * Each CPU's reads, until the worker takes them in (lru_cast_tune_drain()):
+ * a reader takes only its own CPU's lock, and the worker each one's for as
+ * long as it copies the queue out. Half full, the worker is called at
+ * once; otherwise the first read waits LRU_CAST_TUNE_DRAIN_DELAY at most.
+ * Full -- the worker behind -- a read is dropped: the caches see fewer
+ * reads when they cost more than a CPU.
+ */
+#define LRU_CAST_TUNE_QUEUE		256
+#define LRU_CAST_TUNE_DRAIN_DELAY	max(HZ / 100, 1)
+
+struct lru_cast_tune_queue {
+	spinlock_t lock;
+	unsigned int n;
+	struct lru_cast_tune_rec rec[LRU_CAST_TUNE_QUEUE];
+};
+
+static struct lru_cast_tune_queue __percpu *lru_cast_tune_queues;
+static struct lru_cast_tune_rec lru_cast_tune_taken[LRU_CAST_TUNE_QUEUE];	/* the worker's */
+static atomic_long_t lru_cast_tune_dropped;
+
+static void lru_cast_tune_drain(struct work_struct *work);
+static DECLARE_DELAYED_WORK(lru_cast_tune_drain_work, lru_cast_tune_drain);
+
+/*
+ * Both types' curve evidence aged together, a step a tick since the last,
+ * and while it holds more than it may: one time for both (evidence.c).
+ */
+static void lru_cast_tune_age(unsigned long tick)
 {
-	int type = folio_is_file_lru(folio), m;
+	long ticks = tick - lru_cast_tune_aged;
+	int steps, type;
+
+	if (ticks > 0)
+		lru_cast_tune_aged = tick;
+	steps = clamp(ticks, 0L, (long)BITS_PER_LONG);
+	if (!steps && lru_cast_tune_held > LRU_CAST_TUNE_HELD * 256)
+		steps = 1;
+	while (steps--) {
+		for (type = 0; type < ANON_AND_FILE; type++)
+			lru_cast_tune_ev_age(&lru_cast_tune_types[type]->ev);
+		lru_cast_tune_held -= lru_cast_tune_held >> LRU_CAST_TUNE_AGE_SHIFT;
+	}
+}
+
+/* the read @r, taken in by the caches of its type */
+static void lru_cast_tune_take(struct lru_cast_tune_type *t, const struct lru_cast_tune_rec *r)
+{
+	int type = t->type, m;
 	unsigned int rank, read[ANON_AND_FILE];
-	struct lru_cast_tune_type *t;
-	unsigned long flags;
-	u64 id;
 	u16 s, miss = 1, wait;
 	bool full, hit[LRU_CAST_TUNE_N];
 	u32 res;
 
-	if (!READ_ONCE(lru_cast_tune_types[type]))
-		return;
-	id = lru_cast_tune_sample_page(folio);
-
-	spin_lock_irqsave(&lru_cast_tune_lock, flags);
-	t = lru_cast_tune_types[type];		/* replaced under the lock (lru_cast_tune_init()) */
-	if (!t) {
-		spin_unlock_irqrestore(&lru_cast_tune_lock, flags);
-		return;
-	}
-	t->tick = lru_cast_ticks_now();
-	s = lru_cast_tune_sim_read(t->sim, id, t->tick, &res);
+	/* the queues are taken one by one: a CPU's reads can be behind another's */
+	t->tick = max(t->tick, r->tick);
+	s = lru_cast_tune_sim_read(t->sim, r->id, t->tick, &res);
 	if (s == LRU_CAST_TUNE_SIM_NONE)
-		goto out;
+		return;
 	for (m = 0; m < LRU_CAST_TUNE_SIM; m++)
 		hit[m] = res & BIT(m);
 	/*
@@ -152,9 +203,11 @@ void lru_cast_tune_event(struct folio *folio, u64 block)
 		if (!hit[m])
 			miss |= BIT(m - LRU_CAST_TUNE_CURVE + 1);
 	}
-	wait = t->ra ? lru_cast_tune_ra_waits(t->ra, folio, block, miss) : miss;
+	wait = t->ra ? lru_cast_tune_ra_waits(t->ra, r->block, r->index, r->nr, miss) : miss;
 	full = lru_cast_tune_sim_count(t->sim, LRU_CAST_TUNE_CENTER) >= t->cap;
+	lru_cast_tune_age(t->tick);
 	lru_cast_tune_ev_note(&t->ev, hit, wait, full);
+	lru_cast_tune_held += 256;
 	if (full)
 		lru_cast_tune_w_note(&t->w, hit[LRU_CAST_TUNE_WLO], hit[LRU_CAST_TUNE_WHI]);
 
@@ -164,8 +217,75 @@ void lru_cast_tune_event(struct folio *folio, u64 block)
 		lru_cast_tune_evaluate(t);
 	if (t->events >= t->w.next_wtest)
 		lru_cast_tune_w_test(&t->w, t->sim, type, t->events, t->cap);
-out:
-	spin_unlock_irqrestore(&lru_cast_tune_lock, flags);
+}
+
+/* the worker: every CPU's queue taken in, one after another */
+static void lru_cast_tune_drain(struct work_struct *work)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct lru_cast_tune_queue *q = per_cpu_ptr(lru_cast_tune_queues, cpu);
+		unsigned int n, i;
+
+		if (!READ_ONCE(q->n))
+			continue;
+		spin_lock_irq(&q->lock);
+		n = q->n;
+		memcpy(lru_cast_tune_taken, q->rec, n * sizeof(q->rec[0]));
+		q->n = 0;
+		spin_unlock_irq(&q->lock);
+
+		mutex_lock(&lru_cast_tune_lock);
+		for (i = 0; i < n; i++) {
+			const struct lru_cast_tune_rec *r = &lru_cast_tune_taken[i];
+			struct lru_cast_tune_type *t = lru_cast_tune_types[r->type];
+
+			if (t)
+				lru_cast_tune_take(t, r);
+		}
+		mutex_unlock(&lru_cast_tune_lock);
+		cond_resched();
+	}
+}
+
+/* a read of @folio, whose block @block is in the sample (lru_cast_tune_read()): queued */
+void lru_cast_tune_event(struct folio *folio, u64 block)
+{
+	int type = folio_is_file_lru(folio);
+	struct lru_cast_tune_queue *q;
+	struct lru_cast_tune_rec r;
+	unsigned long flags;
+	unsigned int n;
+	bool taken;
+
+	if (!READ_ONCE(lru_cast_tune_types[type]))
+		return;
+
+	r = (struct lru_cast_tune_rec) {
+		.id = lru_cast_tune_sample_page(folio),
+		.block = block,
+		.index = folio->index,
+		.tick = lru_cast_ticks_now(),
+		.nr = folio_nr_pages(folio),
+		.type = type,
+	};
+	q = raw_cpu_ptr(lru_cast_tune_queues);
+	spin_lock_irqsave(&q->lock, flags);
+	n = q->n;
+	taken = n < LRU_CAST_TUNE_QUEUE;
+	if (taken) {
+		q->rec[n++] = r;
+		q->n = n;
+	}
+	spin_unlock_irqrestore(&q->lock, flags);
+	if (!taken)
+		atomic_long_inc(&lru_cast_tune_dropped);
+	else if (n == 1)
+		lru_cast_queue_delayed_work(&lru_cast_tune_drain_work, LRU_CAST_TUNE_DRAIN_DELAY);
+	else if (n == LRU_CAST_TUNE_QUEUE / 2)
+		lru_cast_mod_delayed_work(&lru_cast_tune_drain_work, 0);
+
 	/* mapped, its next reads are caught by a protection fault */
 	if (folio_mapped(folio))
 		lru_cast_protect_queue(folio);
@@ -240,31 +360,46 @@ static void lru_cast_tune_init_type(struct lru_cast_tune_type *t, int type)
  *
  * The samples are taken out from under lru_cast_tune_lock, set up again where they
  * are, and put back: nothing reaches them meanwhile (lru_cast_tune_types[] is read under
- * the lock), and no memory is wanted but the first time. Short of it then,
- * CAST does not come on (lru_cast_set_enabled()), and tries again the next
- * time it is asked to.
+ * the lock), the reads queued of before dropped, and no memory is wanted but
+ * the first time. Short of it then, CAST does not come on
+ * (lru_cast_set_enabled()), and tries again the next time it is asked to.
  */
 int lru_cast_tune_init(void)
 {
 	struct lru_cast_tune_type *t[ANON_AND_FILE];
-	unsigned long flags;
-	int type;
+	int type, cpu;
 
+	if (!lru_cast_tune_queues) {
+		lru_cast_tune_queues = alloc_percpu_gfp(struct lru_cast_tune_queue, LRU_CAST_TUNE_GFP);
+		if (!lru_cast_tune_queues)
+			return -ENOMEM;
+		for_each_possible_cpu(cpu)
+			spin_lock_init(&per_cpu_ptr(lru_cast_tune_queues, cpu)->lock);
+	}
 	if (!lru_cast_tune_nslots) {
 		lru_cast_tune_sample_init(totalram_pages());
 		lru_cast_tune_nslots = min(LRU_CAST_TUNE_TARGET * LRU_CAST_TUNE_TABLE,
 					   lru_cast_tune_sim_max_slots());
 	}
 
-	spin_lock_irqsave(&lru_cast_tune_lock, flags);
+	mutex_lock(&lru_cast_tune_lock);
 	for (type = 0; type < ANON_AND_FILE; type++) {
 		t[type] = lru_cast_tune_types[type];
 		lru_cast_tune_types[type] = NULL;
 	}
 	lru_cast_tune_world_reset();
 	lru_cast_tune_share_reset();
-	spin_unlock_irqrestore(&lru_cast_tune_lock, flags);
+	mutex_unlock(&lru_cast_tune_lock);
 	lru_cast_tune_cost_reset();
+
+	cancel_delayed_work_sync(&lru_cast_tune_drain_work);
+	for_each_possible_cpu(cpu) {
+		struct lru_cast_tune_queue *q = per_cpu_ptr(lru_cast_tune_queues, cpu);
+
+		spin_lock_irq(&q->lock);
+		q->n = 0;
+		spin_unlock_irq(&q->lock);
+	}
 
 	for (type = 0; type < ANON_AND_FILE; type++)
 		if (!t[type])
@@ -277,10 +412,12 @@ int lru_cast_tune_init(void)
 	for (type = 0; type < ANON_AND_FILE; type++)
 		lru_cast_tune_init_type(t[type], type);
 
-	spin_lock_irqsave(&lru_cast_tune_lock, flags);
+	mutex_lock(&lru_cast_tune_lock);
 	for (type = 0; type < ANON_AND_FILE; type++)
 		lru_cast_tune_types[type] = t[type];
-	spin_unlock_irqrestore(&lru_cast_tune_lock, flags);
+	lru_cast_tune_aged = t[0]->tick;
+	lru_cast_tune_held = 0;
+	mutex_unlock(&lru_cast_tune_lock);
 	return 0;
 }
 
@@ -292,12 +429,11 @@ int lru_cast_tune_show(char *buf)
 		unsigned int read[ANON_AND_FILE];
 		struct lru_cast_tune_sim_stat st;
 		struct lru_cast_tune_type *t;
-		unsigned long flags;
 
-		spin_lock_irqsave(&lru_cast_tune_lock, flags);
+		mutex_lock(&lru_cast_tune_lock);
 		t = lru_cast_tune_types[type];
 		if (!t) {
-			spin_unlock_irqrestore(&lru_cast_tune_lock, flags);
+			mutex_unlock(&lru_cast_tune_lock);
 			continue;
 		}
 		len += sysfs_emit_at(buf, len,
@@ -332,7 +468,8 @@ int lru_cast_tune_show(char *buf)
 					     min(held, (unsigned long)read[type]),
 					     t->ev.miss[m] >> 8, t->ev.dis[m] >> 8);
 		}
-		spin_unlock_irqrestore(&lru_cast_tune_lock, flags);
+		mutex_unlock(&lru_cast_tune_lock);
 	}
+	len += sysfs_emit_at(buf, len, "reads dropped %ld\n", atomic_long_read(&lru_cast_tune_dropped));
 	return len;
 }

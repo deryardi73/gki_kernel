@@ -36,6 +36,12 @@
  * sentinels, so a slot leaves one without knowing which. With the table
  * full, a new page takes the slot of the lowest page in the order resident
  * in no cache: the one every size would have let go first.
+ *
+ * A page not read for long is marked stale, then deep, as the main cache's
+ * words are (core/core.h): a part of the slots at each tick, each in
+ * LRU_CAST_STALE_PASS ticks. Its key then changes once, at the mark, and
+ * is as fixed as any other: the page moves in each cache it is in M of
+ * and in the order, as a read would move it.
  */
 #include <linux/hash.h>
 #include <linux/rbtree_augmented.h>
@@ -79,6 +85,13 @@ struct lru_cast_tune_sim {
 	int ole;			/* the order's decay */
 	unsigned int tracked;		/* slots in it */
 	u64 seq;			/* reads */
+	/* the keys of the slot being read, at the decays asked so far (lru_cast_tune_skey()) */
+	u16 kslot;
+	u16 khave;
+	long kkey[LRU_CAST_LE_MAX + 1];
+	unsigned long stale_tick;	/* the tick the marking has looked up to */
+	unsigned int stale_slot;	/* the slot it looks at next */
+	unsigned int stale_todo;	/* ... and how many it has yet to */
 };
 
 static inline u16 lru_cast_tune_head(struct lru_cast_tune_sim *sim, int m, unsigned int idx)
@@ -91,11 +104,25 @@ static inline u16 lru_cast_tune_whead(struct lru_cast_tune_sim *sim, int m)
 	return lru_cast_tune_head(sim, m, LRU_CAST_TUNE_BUCKETS);
 }
 
-/* the key of @w at decay @le in buckets: its key's, then which of them (see above) */
+/*
+ * the key of @w at decay @le in buckets: its key's, then which of them (see
+ * above). Of the slot being read, each decay's once: the caches of one
+ * decay agree.
+ */
 static long lru_cast_tune_skey(struct lru_cast_tune_sim *sim, u16 s, int le)
 {
 	u32 w = sim->slot[s].w;
-	long key = lru_cast_key(w, sim->tick, le);
+	long key;
+
+	if (s != sim->kslot) {
+		key = lru_cast_key(w, sim->tick, le);
+	} else if (sim->khave & BIT(le)) {
+		key = sim->kkey[le];
+	} else {
+		key = lru_cast_key(w, sim->tick, le);
+		sim->kkey[le] = key;
+		sim->khave |= BIT(le);
+	}
 
 	if (key == LONG_MIN)
 		return LONG_MIN;
@@ -384,6 +411,8 @@ void lru_cast_tune_sim_access_all(struct lru_cast_tune_sim *sim, u16 s, u32 res)
 {
 	int m;
 
+	sim->kslot = s;			/* its word stays as it is meanwhile */
+	sim->khave = 0;
 	for (m = 0; m < LRU_CAST_TUNE_SIM; m++) {
 		lru_cast_tune_access(sim, m, s, res & BIT(m));
 		lru_cast_tune_balance(sim, m);
@@ -391,6 +420,7 @@ void lru_cast_tune_sim_access_all(struct lru_cast_tune_sim *sim, u16 s, u32 res)
 	if (!RB_EMPTY_NODE(&sim->slot[s].rb))
 		lru_cast_tune_oerase(sim, s);
 	lru_cast_tune_oinsert(sim, s, ++sim->seq);
+	sim->kslot = LRU_CAST_TUNE_SIM_NONE;
 }
 
 /* @s's rank in the order, 1 the top, before its read reaches it; 0: not in it */
@@ -469,6 +499,58 @@ static u16 lru_cast_tune_alloc(struct lru_cast_tune_sim *sim, u64 id)
 }
 
 /*
+ * What the marking does in a read, and in one when it is a pass behind: a
+ * slot looked at costs 1, one marked, moved in every cache and the order,
+ * LRU_CAST_TUNE_MARK_MOVE
+ */
+#define LRU_CAST_TUNE_MARK_STEP		64
+#define LRU_CAST_TUNE_MARK_CATCHUP	256
+#define LRU_CAST_TUNE_MARK_MOVE		16
+
+/*
+ * The slots marked stale or deep where their read is old, as the main
+ * cache's words are (core/clock.c), each moved by its new key in the caches
+ * it is in M of and in the order. Each tick owes a part of the table, a
+ * pass in LRU_CAST_STALE_PASS ticks; the reads pay it, a little each --
+ * slots read at one time go stale at one time, and a few are moved in a
+ * read -- and more each only while a whole pass is owed.
+ */
+static void lru_cast_tune_mark(struct lru_cast_tune_sim *sim)
+{
+	unsigned int part = DIV_ROUND_UP(sim->nslots, LRU_CAST_STALE_PASS), s;
+	unsigned long ticks = min(sim->tick - sim->stale_tick, (unsigned long)LRU_CAST_STALE_PASS);
+	int budget;
+
+	sim->stale_tick = sim->tick;
+	sim->stale_todo = min_t(unsigned long, sim->stale_todo + ticks * part, 2 * sim->nslots);
+	budget = sim->stale_todo > sim->nslots ? LRU_CAST_TUNE_MARK_CATCHUP : LRU_CAST_TUNE_MARK_STEP;
+	for (s = sim->stale_slot; sim->stale_todo && budget > 0;
+	     s = s + 1 < sim->nslots ? s + 1 : 0) {
+		struct lru_cast_tune_slot *sl = &sim->slot[s];
+		u32 w = sl->id ? lru_cast_mark(sl->w, sim->tick) : 0;
+		int m;
+
+		sim->stale_todo--;
+		budget--;
+		if (!w)
+			continue;
+		budget -= LRU_CAST_TUNE_MARK_MOVE;
+		sl->w = w;
+		for (m = 0; m < LRU_CAST_TUNE_SIM; m++) {
+			if ((sl->res & ~sl->inw) & BIT(m)) {
+				lru_cast_tune_unlink(sim, s, m);
+				lru_cast_tune_place(sim, m, s, lru_cast_tune_mkey(sim, m, s));
+			}
+		}
+		if (!RB_EMPTY_NODE(&sl->rb)) {
+			lru_cast_tune_oerase(sim, s);
+			lru_cast_tune_oinsert(sim, s, sl->seq);
+		}
+	}
+	sim->stale_slot = s;
+}
+
+/*
  * A read of page @id at @tick, the nodes' clock: its slot, given one if it
  * has none (LRU_CAST_TUNE_SIM_NONE: no room), and the read in its state word. @res:
  * the caches it is resident in, before the read reaches them, and its rank
@@ -480,6 +562,8 @@ u16 lru_cast_tune_sim_read(struct lru_cast_tune_sim *sim, u64 id, unsigned long 
 	u32 old, n;
 
 	sim->tick = tick;
+	if (sim->stale_todo || tick != sim->stale_tick)
+		lru_cast_tune_mark(sim);
 	if (s == LRU_CAST_TUNE_SIM_NONE)
 		s = lru_cast_tune_alloc(sim, id);
 	if (s == LRU_CAST_TUNE_SIM_NONE)
@@ -592,6 +676,7 @@ struct lru_cast_tune_sim *lru_cast_tune_sim_alloc(unsigned int nslots)
 	struct lru_cast_tune_sim *sim;
 
 	BUILD_BUG_ON(LRU_CAST_TUNE_SIM > 16);		/* res and inw are bitmasks */
+	BUILD_BUG_ON(LRU_CAST_LE_MAX >= 16);		/* khave is a bitmask */
 	if (WARN_ON_ONCE(nslots > lru_cast_tune_sim_max_slots()))
 		return NULL;
 	sim = kvmalloc(sizeof(*sim), LRU_CAST_TUNE_GFP);
@@ -627,6 +712,7 @@ void lru_cast_tune_sim_init(struct lru_cast_tune_sim *sim, unsigned long tick, c
 	memset(sim->hash, 0xff, (1U << sim->hbits) * sizeof(*sim->hash));
 	memset(sim->c, 0, sizeof(sim->c));
 	sim->free = LRU_CAST_TUNE_SIM_NONE;
+	sim->kslot = LRU_CAST_TUNE_SIM_NONE;
 	for (s = sim->nslots; s-- > 0;) {
 		sim->slot[s].hnext = sim->free;
 		sim->free = s;
@@ -636,6 +722,9 @@ void lru_cast_tune_sim_init(struct lru_cast_tune_sim *sim, unsigned long tick, c
 	sim->ole = -1;
 	sim->tracked = 0;
 	sim->seq = 0;
+	sim->stale_tick = tick;
+	sim->stale_slot = 0;
+	sim->stale_todo = 0;
 	for (m = 0; m < LRU_CAST_TUNE_SIM; m++) {
 		sim->c[m].cap = 256;
 		src[m] = m;

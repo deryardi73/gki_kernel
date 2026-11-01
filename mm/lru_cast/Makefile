@@ -9,6 +9,7 @@
 # (check-layers.sh):
 #
 #	core/	core.h		state words, the eviction clock, keys, prefetch
+#		inl.h		its inline forms, for policy/'s hot loops
 #	policy/	policy.h	the main cache inside reclaim, its parameters
 #	walk/	walk.h		young bits of mapped pages
 #	tune/	tune.h		the controllers that set the parameters

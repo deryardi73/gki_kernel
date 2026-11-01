@@ -4,7 +4,7 @@
 # CAST: check that each component includes only what it may.
 #
 #	core/	nothing of CAST's but compat/
-#	policy/	core/core.h
+#	policy/	core/core.h, core/inl.h (core's inline forms for its hot loops)
 #	walk/	core/core.h
 #	tune/	core/core.h, policy/policy.h
 #	.	every component's public header, nothing inside a component
@@ -27,7 +27,7 @@ allowed() {	# $1 the including file, $2 the included path
 	case "$1" in
 	compat/*)	return 1 ;;
 	core/*)		deps="" ;;
-	policy/*)	deps="core/core.h" ;;
+	policy/*)	deps="core/core.h core/inl.h" ;;
 	walk/*)		deps="core/core.h" ;;
 	tune/*)		deps="core/core.h policy/policy.h" ;;
 	*)		deps="$public" ;;

@@ -17,10 +17,16 @@
  * only the pages that faulted in between -- or had a read recorded by the
  * main cache -- are in it. The TLB is flushed once a batch, per mm, not per
  * page: a flush per page was an IPI per page to the CPUs running the mm.
- * Until the flush a stale entry lets a read through without its fault --
- * one read the sample misses, nothing more, as the PTE only grew stricter. A page touched again within delta faults once:
- * the model's finding is that this loses nothing, and it keeps the faults
- * to about 0.6% of accesses.
+ * Until the flush a stale entry lets a read through without its fault, one
+ * read the sample misses; and the rest of the kernel must know the entry
+ * may be there. A PROT_NONE PTE is taken as cached only while its mm has a
+ * flush pending (pte_accessible()): unmapped without, by reclaim or
+ * migration, the page would be freed with no flush and read on through
+ * the stale entry by its next owner's data. So the batch holds each mm's
+ * tlb_flush_pending raised from before its first PTE is made PROT_NONE
+ * until its flush, as change_protection() does for NUMA balancing. A page
+ * touched again within delta faults once: the model's finding is that this
+ * loses nothing, and it keeps the faults to about 0.6% of accesses.
  *
  * Only while NUMA balancing is off -- a single node, or switched off: then
  * every hinting fault is CAST's. With it on, no page is protected and the
@@ -50,26 +56,42 @@ struct lru_cast_prot_flush {
 	int n;
 };
 
+/* each mm flushed, and only then its flush no longer pending */
 static void lru_cast_prot_flush_all(struct lru_cast_prot_flush *f)
 {
 	while (f->n) {
 		struct mm_struct *mm = f->mm[--f->n];
 
 		flush_tlb_mm(mm);
+		dec_tlb_flush_pending(mm);
 		mmdrop(mm);
 	}
 }
 
-static void lru_cast_prot_flush_add(struct lru_cast_prot_flush *f, struct mm_struct *mm)
+static bool lru_cast_prot_flush_has(struct lru_cast_prot_flush *f, struct mm_struct *mm)
 {
 	int i;
 
 	for (i = 0; i < f->n; i++)
 		if (f->mm[i] == mm)
-			return;
-	if (f->n == LRU_CAST_PROT_MMS)
+			return true;
+	return false;
+}
+
+/* room for @mm, the others flushed if there is none: before the PTL is taken */
+static void lru_cast_prot_flush_room(struct lru_cast_prot_flush *f, struct mm_struct *mm)
+{
+	if (f->n == LRU_CAST_PROT_MMS && !lru_cast_prot_flush_has(f, mm))
 		lru_cast_prot_flush_all(f);
+}
+
+/* @mm's flush pending, before the first of its PTEs is made PROT_NONE */
+static void lru_cast_prot_flush_add(struct lru_cast_prot_flush *f, struct mm_struct *mm)
+{
+	if (lru_cast_prot_flush_has(f, mm))
+		return;
 	mmgrab(mm);
+	inc_tlb_flush_pending(mm);
 	f->mm[f->n++] = mm;
 }
 
@@ -116,6 +138,7 @@ static bool lru_cast_prot_arm_one(struct folio *folio, struct vm_area_struct *vm
 	    (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_MIXEDMAP)))
 		return true;
 
+	lru_cast_prot_flush_room(arg, vma->vm_mm);
 	lru_cast_mmu_range_init(&range, vma->vm_mm, address,
 			     min(vma->vm_end, address + folio_size(folio)));
 	mmu_notifier_invalidate_range_start(&range);
@@ -127,6 +150,8 @@ static bool lru_cast_prot_arm_one(struct folio *folio, struct vm_area_struct *vm
 		old = ptep_get(pvmw.pte);
 		if (!pte_present(old) || pte_protnone(old))
 			continue;
+		if (!armed)	/* under the PTL, before the PTE changes: inc_tlb_flush_pending() */
+			lru_cast_prot_flush_add(arg, vma->vm_mm);
 		old = ptep_modify_prot_start(vma, pvmw.address, pvmw.pte);
 		new = pte_modify(old, PAGE_NONE);
 		ptep_modify_prot_commit(vma, pvmw.address, pvmw.pte, old, new);
@@ -134,8 +159,6 @@ static bool lru_cast_prot_arm_one(struct folio *folio, struct vm_area_struct *vm
 		armed = true;
 	}
 	mmu_notifier_invalidate_range_end(&range);
-	if (armed)
-		lru_cast_prot_flush_add(arg, vma->vm_mm);
 	return true;
 }
 

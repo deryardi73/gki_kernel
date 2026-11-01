@@ -19,6 +19,7 @@ struct lru_cast_tune_ra;
 struct lru_cast_tune_ra *lru_cast_tune_ra_alloc(void);
 void lru_cast_tune_ra_free(struct lru_cast_tune_ra *ra);
 void lru_cast_tune_ra_init(struct lru_cast_tune_ra *ra);
-u16 lru_cast_tune_ra_waits(struct lru_cast_tune_ra *ra, struct folio *folio, u64 block, u16 miss);
+u16 lru_cast_tune_ra_waits(struct lru_cast_tune_ra *ra, u64 block, pgoff_t index,
+			   unsigned int nr, u16 miss);
 
 #endif /* _MM_LRU_CAST_TUNE_SAMPLE_H */

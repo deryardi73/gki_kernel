@@ -51,6 +51,12 @@
 /* unlock_page_lruvec_irq() is lruvec_unlock_irq() (7.1). */
 #define LRU_CAST_CAP_LRUVEC_UNLOCK		(LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0))
 
+/*
+ * A swap slot's count and zero flag sit in the top SWAP_COUNT_SHIFT bits of
+ * the swap table word that holds an anon shadow (mm/swap_table.h, 7.1).
+ */
+#define LRU_CAST_CAP_SWAP_TB_FLAGS		(LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0))
+
 /* workingset_age_nonresident() is declared in mm/internal.h, not linux/swap.h (7.3). */
 #define LRU_CAST_CAP_AGE_NONRESIDENT_INTERNAL	(LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0))
 

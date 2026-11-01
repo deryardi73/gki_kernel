@@ -8,7 +8,13 @@
  * and whether it had been read more than once, over the bit that marks it
  * CAST's:
  *
- *	| state word 32 | tick 16 | node NODES_SHIFT | workingset 1 | kind 1 |
+ *	| history H | tick 16 | node NODES_SHIFT | workingset 1 | kind 1 |
+ *
+ * The history, H = LRU_CAST_W_HISTORY_BITS bits, is the state word less its
+ * owner tag (lru_cast_read() gives none, lru_cast_write() keeps the
+ * frame's): its read count over its tick and gaps. An anon shadow is kept
+ * in the swap table, whose top LRU_CAST_SHADOW_ANON_RESERVED bits of the
+ * word are the slot's count and zero flag; the shadow stays below them.
  *
  * The tick wraps after 65536 ticks, 16384 turnovers of the node's memory;
  * a shadow that old comes back as recent, and only then.
@@ -38,14 +44,15 @@
 
 #define LRU_CAST_SHADOW_WS		1
 #define LRU_CAST_SHADOW_TICK	16
-#define LRU_CAST_SHADOW_STATE	32
+#define LRU_CAST_SHADOW_STATE	LRU_CAST_W_HISTORY_BITS
 
 static void *lru_cast_pack(u32 w, u16 tick, int nid, bool workingset)
 {
-	unsigned long v = w;
+	unsigned long v = lru_cast_history_pack(w);
 
 	BUILD_BUG_ON(LRU_CAST_SHADOW_STATE + LRU_CAST_SHADOW_TICK + NODES_SHIFT +
-		     LRU_CAST_SHADOW_WS + LRU_CAST_SHADOW_KIND > BITS_PER_XA_VALUE);
+		     LRU_CAST_SHADOW_WS + LRU_CAST_SHADOW_KIND >
+		     BITS_PER_XA_VALUE - LRU_CAST_SHADOW_ANON_RESERVED);
 	v = (v << LRU_CAST_SHADOW_TICK) | tick;
 	v = (v << NODES_SHIFT) | nid;
 	v = (v << LRU_CAST_SHADOW_WS) | workingset;
@@ -63,11 +70,11 @@ static void lru_cast_unpack(void *shadow, u32 *w, u16 *tick, int *nid, bool *wor
 	v >>= NODES_SHIFT;
 	*tick = v & 0xffff;
 	v >>= LRU_CAST_SHADOW_TICK;
-	*w = v;
+	*w = lru_cast_history_unpack(v);
 }
 
-/* the shadow's history if it is still worth having, else false */
-static bool lru_cast_ghost(void *shadow, int nid, int type, u32 *w, bool *workingset)
+/* the shadow is CAST's, left on this node within the ghosts' window: its history read out */
+static bool lru_cast_ghost_recent(void *shadow, int nid, int type, u32 *w, bool *workingset)
 {
 	u16 tick;
 	int snid;
@@ -76,18 +83,25 @@ static bool lru_cast_ghost(void *shadow, int nid, int type, u32 *w, bool *workin
 	if (!lru_cast_shadow(shadow))
 		return false;
 	lru_cast_unpack(shadow, w, &tick, &snid, workingset);
-	if (snid != nid || !node_online(snid) || !(*w >> 24))
+	if (snid != nid || !node_online(snid))
 		return false;
 	return (u16)(lru_cast_tick(NODE_DATA(snid), type) - tick) <= LRU_CAST_GHOST_TICKS;
+}
+
+/* the shadow's history if it is still worth having, else false */
+static bool lru_cast_ghost(void *shadow, int nid, int type, u32 *w, bool *workingset)
+{
+	return lru_cast_ghost_recent(shadow, nid, type, w, workingset) && (*w >> 24);
 }
 
 void *lru_cast_eviction(struct folio *folio)
 {
 	struct pglist_data *pgdat = folio_pgdat(folio);
+	int type = folio_is_file_lru(folio);
 	u32 w = lru_cast_read(folio);
 
-	return lru_cast_pack(w, lru_cast_tick(pgdat, folio_is_file_lru(folio)), pgdat->node_id,
-			  (w >> 24) > 1);
+	lru_cast_shadowed(pgdat, type, folio_nr_pages(folio));
+	return lru_cast_pack(w, lru_cast_tick(pgdat, type), pgdat->node_id, (w >> 24) > 1);
 }
 
 bool lru_cast_test_recent(void *shadow, bool file, bool *workingset)
@@ -111,7 +125,10 @@ void lru_cast_refault(struct folio *folio, void *shadow)
 	rcu_read_lock();
 	lruvec = folio_lruvec(folio);
 	mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + type, nr);
-	if (!lru_cast_ghost(shadow, folio_nid(folio), type, &w, &workingset))
+	if (!lru_cast_ghost_recent(shadow, folio_nid(folio), type, &w, &workingset))
+		goto out;
+	lru_cast_returned(folio_pgdat(folio), type, nr);	/* the eviction undone */
+	if (!(w >> 24))
 		goto out;
 
 	/*

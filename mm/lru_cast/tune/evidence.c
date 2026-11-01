@@ -7,8 +7,18 @@
  * ranks, not from those caches, and keep theirs from the first read: a
  * type whose sample never fills its cache -- a few pages read all the
  * time, a program's text -- would otherwise wait at no split, and the
- * share would give its memory away for nothing. Everything decays by 1/16
- * an evaluation, a time constant of about one cache of accesses.
+ * share would give its memory away for nothing.
+ *
+ * What a type's caches are weighed by against each other -- the decay
+ * grid's and W's -- decays by 1/16 an evaluation of the type, a time
+ * constant of about one cache of its accesses. What the share weighs the
+ * two types by -- the curve, its patterns and a cache of nothing's waits --
+ * cannot: the types read at their own rates, and a count over the last
+ * cache of each type's accesses is a count over a time of its own. Anon
+ * read a hundred times as often as file would be weighed over a hundredth
+ * of the time, its misses as if a hundredth as many. The curve's evidence
+ * is a count over one time for both types: it ages on the clock both share
+ * (lru_cast_tune_ev_age()), a cache's worth of what memory takes in.
  */
 #include "tune/evidence.h"
 
@@ -42,18 +52,30 @@ void lru_cast_tune_ev_note(struct lru_cast_tune_evidence *ev, const bool *hit, u
 	__set_bit(wait, ev->pats);
 }
 
+/* the decay grid's and W's evidence, by 1/16: an evaluation of the type */
 void lru_cast_tune_ev_decay(struct lru_cast_tune_evidence *ev)
+{
+	int m;
+
+	for (m = 0; m < LRU_CAST_TUNE_CURVE; m++) {
+		ev->miss[m] -= ev->miss[m] >> 4;
+		ev->dis[m] -= ev->dis[m] >> 4;
+	}
+}
+
+/* the curve's evidence, by 1 / 2^LRU_CAST_TUNE_AGE_SHIFT: a step of the time both types share */
+void lru_cast_tune_ev_age(struct lru_cast_tune_evidence *ev)
 {
 	unsigned int p;
 	int m;
 
-	for (m = 0; m < LRU_CAST_TUNE_N; m++) {
-		ev->miss[m] -= ev->miss[m] >> 4;
-		ev->dis[m] -= ev->dis[m] >> 4;
+	for (m = LRU_CAST_TUNE_CURVE; m < LRU_CAST_TUNE_N; m++) {
+		ev->miss[m] -= ev->miss[m] >> LRU_CAST_TUNE_AGE_SHIFT;
+		ev->dis[m] -= ev->dis[m] >> LRU_CAST_TUNE_AGE_SHIFT;
 	}
-	ev->evd -= ev->evd >> 4;
+	ev->evd -= ev->evd >> LRU_CAST_TUNE_AGE_SHIFT;
 	for_each_set_bit(p, ev->pats, LRU_CAST_TUNE_PATS) {
-		ev->pat[p] -= ev->pat[p] >> 4;
+		ev->pat[p] -= ev->pat[p] >> LRU_CAST_TUNE_AGE_SHIFT;
 		if (!ev->pat[p])
 			__clear_bit(p, ev->pats);
 	}
@@ -64,9 +86,9 @@ void lru_cast_tune_ev_decay(struct lru_cast_tune_evidence *ev)
  * was of caches no longer there. The curve's points keep their counts:
  * they take the new le together and are weighed only against each other
  * (with evd and pat, which stay too), and what they learnt under the old
- * one fades as everything does. Zeroed, they would sit at nothing next to
- * evd's and pat's counts, and a split would look free of the type's misses
- * until they filled again.
+ * one fades as the rest of the curve's evidence does. Zeroed, they would
+ * sit at nothing next to evd's and pat's counts, and a split would look
+ * free of the type's misses until they filled again.
  */
 void lru_cast_tune_ev_forget_grid(struct lru_cast_tune_evidence *ev)
 {

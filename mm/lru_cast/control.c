@@ -194,6 +194,7 @@ void lru_cast_switch_end(void)
 
 static int __init lru_cast_init(void)
 {
+	lru_cast_key_init();
 	lru_cast_prefetch_init();
 	if (lru_cast_active && (lru_cast_store_init() || lru_cast_tune_init())) {
 		pr_warn(LRU_CAST_PROGNAME ": no memory to run on, off\n");

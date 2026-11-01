@@ -22,7 +22,7 @@ static inline bool lru_cast_young_take(struct folio *folio)
 	u32 w = lru_cast_read(folio);
 
 	return !(w >> 24) ||
-	       (u8)w != (u8)lru_cast_tick(folio_pgdat(folio), folio_is_file_lru(folio));
+	       lru_cast_age(w, lru_cast_tick(folio_pgdat(folio), folio_is_file_lru(folio)));
 }
 
 /*

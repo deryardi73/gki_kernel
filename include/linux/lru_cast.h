@@ -67,6 +67,21 @@ static inline bool lru_cast_on(struct lruvec *lruvec)
 	return READ_ONCE(lruvec->lru_cast_on);
 }
 
+/*
+ * too_many_isolated() (mm/vmscan.c) for a CAST lruvec: whether a direct
+ * reclaimer waits instead of isolating more of @type. What is evicted and
+ * faulted straight back frees nothing; it only trades pages between tasks.
+ * So the rule weighs the pages in flight by r, the share of evictions that
+ * came back within the ghosts' window (core/clock.c), and lets the pages
+ * that will come back be at most a batch: with r near 1, a thrash, direct
+ * reclaimers go one at a time and the tasks that fit keep the CPU; with r
+ * near 0, a stream, they all reclaim, each page freed for good. Upstream
+ * weighs the pages against the inactive list, for CAST W, whose size only
+ * happened to follow r.
+ */
+bool lru_cast_too_many_isolated(struct pglist_data *pgdat, int type, unsigned long isolated,
+				bool io_fs);
+
 /* what mm/vmscan.c knows of a scan, and the counts handed back */
 struct lru_cast_scan {
 	int type;
@@ -296,6 +311,12 @@ static inline bool lru_cast_enabled(void)
 }
 
 static inline bool lru_cast_on(struct lruvec *lruvec)
+{
+	return false;
+}
+
+static inline bool lru_cast_too_many_isolated(struct pglist_data *pgdat, int type,
+					      unsigned long isolated, bool io_fs)
 {
 	return false;
 }

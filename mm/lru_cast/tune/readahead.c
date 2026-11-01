@@ -47,18 +47,20 @@ void lru_cast_tune_ra_init(struct lru_cast_tune_ra *ra)
 
 /*
  * Which of the curve's points (bit p: p tenths; 0 misses all) wait for the
- * read of @folio, given those that miss it -- a miss in an open window
- * does not -- and the windows after it. The run before a block is out of
- * sight: a read at its start begins one, as a read of a file's start does.
+ * read of the @nr pages at @index of @block, given those that miss it -- a
+ * miss in an open window does not -- and the windows after it. The run
+ * before a block is out of sight: a read at its start begins one, as a
+ * read of a file's start does.
  */
-u16 lru_cast_tune_ra_waits(struct lru_cast_tune_ra *ra, struct folio *folio, u64 block, u16 miss)
+u16 lru_cast_tune_ra_waits(struct lru_cast_tune_ra *ra, u64 block, pgoff_t index,
+			   unsigned int nr, u16 miss)
 {
 	struct lru_cast_tune_blk *b = &ra->blk[hash_64(block, ilog2(LRU_CAST_TUNE_BLKS))];
-	bool run = b->id == block && b->next == folio->index;
+	bool run = b->id == block && b->next == index;
 	u16 wait = run ? miss & ~b->win : miss;
 
 	b->id = block;
-	b->win = run ? b->win | miss : folio->index % LRU_CAST_TUNE_BLOCK ? 0 : miss;
-	b->next = folio->index + folio_nr_pages(folio);
+	b->win = run ? b->win | miss : index % LRU_CAST_TUNE_BLOCK ? 0 : miss;
+	b->next = index + nr;
 	return wait;
 }

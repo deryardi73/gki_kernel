@@ -10,6 +10,6 @@
 #define LRU_CAST_PROGNAME	"lru_cast"
 #define LRU_CAST_AUTHOR	"Masahito Suzuki"
 
-#define LRU_CAST_VERSION	"0.2.6"
+#define LRU_CAST_VERSION	"0.2.9"
 
 #endif /* _MM_LRU_CAST_VERSION_H */
